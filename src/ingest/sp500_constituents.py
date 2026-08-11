@@ -101,6 +101,85 @@ def save_raw_wiki_html(output_file=os.path.join("data", "1_raw", "wiki", "sp500_
     return True
 
 
+def build_ticker_lifespans(current_tickers, changes_df):
+    """
+    Combine current constituents with historical add/remove changes into
+    {ticker: {'Date_added': Timestamp or None, 'Date_removed': Timestamp or 'present'}}.
+    Date_added keeps the earliest add event; Date_removed keeps the latest
+    remove event, unless the ticker is a current constituent, in which case
+    it always stays 'present'.
+    """
+    lifespans = {
+        ticker: {'Date_added': None, 'Date_removed': 'present'}
+        for ticker in current_tickers
+    }
+
+    sorted_changes = changes_df.sort_values('Date')
+
+    for _, row in sorted_changes.iterrows():
+        date = row['Date']
+        added = row['Added_Ticker']
+        removed = row['Removed_Ticker']
+
+        if added:
+            if added not in lifespans:
+                lifespans[added] = {'Date_added': date,
+                                     'Date_removed': 'present'}
+            elif lifespans[added]['Date_added'] is None:
+                lifespans[added]['Date_added'] = date
+
+        if removed:
+            if removed not in lifespans:
+                lifespans[removed] = {'Date_added': None, 'Date_removed': date}
+            elif lifespans[removed]['Date_removed'] != 'present':
+                lifespans[removed]['Date_removed'] = date
+
+    return lifespans
+
+
+def lifespans_to_dataframe(lifespans):
+    """
+    Convert {ticker: {Date_added, Date_removed}} into the master_ticker_list.csv
+    shape: Symbol/Date_added/Date_removed, sorted by Symbol.
+    """
+    rows = [
+        {'Symbol': ticker, 'Date_added': dates['Date_added'],
+         'Date_removed': dates['Date_removed']}
+        for ticker, dates in lifespans.items()
+    ]
+    return pd.DataFrame(rows, columns=['Symbol', 'Date_added', 'Date_removed']).sort_values('Symbol').reset_index(drop=True)
+
+
+def save_master_ticker_list(
+    raw_html_file=os.path.join(
+        "data", "1_raw", "wiki", "sp500_wikipedia_page.html"),
+    output_file=os.path.join(
+        "data", "2_processed", "master_ticker_list.csv")
+):
+    """
+    Stage 2 (process raw -> Silver layer): read the raw HTML saved by
+    save_raw_wiki_html(), parse + merge into master_ticker_list.csv.
+    No network call, so it can be re-run freely to debug/fix the merge
+    logic without re-downloading.
+    """
+    if not os.path.exists(raw_html_file):
+        print(
+            f"Raw HTML not found: {raw_html_file}. Run save_raw_wiki_html() first.")
+        return False
+
+    with open(raw_html_file, 'r', encoding='utf-8') as f:
+        html_content = f.read()
+
+    current_tickers, changes_df = parse_sp500_tables(html_content)
+    lifespans = build_ticker_lifespans(current_tickers, changes_df)
+    master_df = lifespans_to_dataframe(lifespans)
+
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    master_df.to_csv(output_file, index=False)
+
+    return True
+
+
 def get_sp500_tickers_by_date(target_date):
     """
     Main function: Get S&P 500 tickers for a specific date

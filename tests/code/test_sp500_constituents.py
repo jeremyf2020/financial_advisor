@@ -224,3 +224,190 @@ def test_save_raw_wiki_html_connection_failure(tmp_path):
     # Assert: reports failure, no file written
     assert result is False
     assert not output_file.exists()
+
+
+def test_build_ticker_lifespans_current_only():
+    """
+    Current constituent with no changes history should have no known
+    Date_added and be marked as still 'present'
+    """
+    # Arrange: one current ticker, no changes at all
+    mock_current = {'A'}
+    mock_changes = pd.DataFrame({
+        'Date': pd.to_datetime([]),
+        'Added_Ticker': [],
+        'Removed_Ticker': []
+    })
+
+    # Act: build the lifespan dict
+    lifespans = sp500_constituents.build_ticker_lifespans(
+        mock_current, mock_changes)
+
+    # Assert: no add date on record, still present
+    assert lifespans['A']['Date_added'] is None
+    assert lifespans['A']['Date_removed'] == 'present'
+
+
+def test_build_ticker_lifespans_historical_removal():
+    """
+    A ticker that was removed and is not a current constituent should
+    keep its removal date instead of 'present'
+    """
+    # Arrange: 'B' is not in current_tickers, was removed in the past
+    mock_current = {'A'}
+    mock_changes = pd.DataFrame({
+        'Date': pd.to_datetime(['2019-06-01']),
+        'Added_Ticker': [''],
+        'Removed_Ticker': ['B']
+    })
+
+    # Act: build the lifespan dict
+    lifespans = sp500_constituents.build_ticker_lifespans(
+        mock_current, mock_changes)
+
+    # Assert: 'B' recorded with its removal date, not 'present'
+    assert lifespans['B']['Date_removed'] == pd.Timestamp('2019-06-01')
+
+
+def test_build_ticker_lifespans_keeps_earliest_add_date():
+    """
+    If a ticker shows up as 'added' more than once in the changes history,
+    the earliest date should win (first time it actually joined)
+    """
+    # Arrange: 'A' added twice, in 2015 then again in 2021
+    mock_current = {'A'}
+    mock_changes = pd.DataFrame({
+        'Date': pd.to_datetime(['2021-01-01', '2015-03-01']),
+        'Added_Ticker': ['A', 'A'],
+        'Removed_Ticker': ['', '']
+    })
+
+    # Act: build the lifespan dict
+    lifespans = sp500_constituents.build_ticker_lifespans(
+        mock_current, mock_changes)
+
+    # Assert: Date_added is the earliest of the two dates, not the latest
+    assert lifespans['A']['Date_added'] == pd.Timestamp('2015-03-01')
+
+
+def test_build_ticker_lifespans_keeps_latest_removal_date():
+    """
+    If a historical (non-current) ticker was removed more than once,
+    the latest removal date should win (most recent time it actually left)
+    """
+    # Arrange: 'C' is not current, removed once in 2018 then again in 2022
+    mock_current = {'A'}
+    mock_changes = pd.DataFrame({
+        'Date': pd.to_datetime(['2018-05-01', '2022-09-01']),
+        'Added_Ticker': ['', ''],
+        'Removed_Ticker': ['C', 'C']
+    })
+
+    # Act: build the lifespan dict
+    lifespans = sp500_constituents.build_ticker_lifespans(
+        mock_current, mock_changes)
+
+    # Assert: Date_removed is the latest of the two dates, not the earliest
+    assert lifespans['C']['Date_removed'] == pd.Timestamp('2022-09-01')
+
+
+def test_build_ticker_lifespans_readded_stays_present():
+    """
+    A ticker that was removed in the past but is a current constituent
+    (i.e. it was re-added later) should stay marked 'present', not be
+    overwritten by its earlier removal date
+    """
+    # Arrange: 'A' is current, but was removed once back in 2017 before rejoining
+    mock_current = {'A'}
+    mock_changes = pd.DataFrame({
+        'Date': pd.to_datetime(['2017-01-01']),
+        'Added_Ticker': [''],
+        'Removed_Ticker': ['A']
+    })
+
+    # Act: build the lifespan dict
+    lifespans = sp500_constituents.build_ticker_lifespans(
+        mock_current, mock_changes)
+
+    # Assert: current constituency wins over the stale historical removal event
+    assert lifespans['A']['Date_removed'] == 'present'
+
+
+def test_lifespans_to_dataframe():
+    """
+    Convert the {ticker: {Date_added, Date_removed}} dict into the
+    master_ticker_list.csv shape: Symbol/Date_added/Date_removed, sorted
+    """
+    # Arrange: a small unsorted lifespans dict
+    lifespans = {
+        'B': {'Date_added': pd.Timestamp('2010-01-01'), 'Date_removed': 'present'},
+        'A': {'Date_added': None, 'Date_removed': pd.Timestamp('2019-01-01')},
+    }
+
+    # Act: convert to DataFrame
+    df = sp500_constituents.lifespans_to_dataframe(lifespans)
+
+    # Assert: correct columns, sorted by Symbol, values preserved
+    assert list(df.columns) == ['Symbol', 'Date_added', 'Date_removed']
+    assert df['Symbol'].tolist() == ['A', 'B']
+    # pandas coerces a mixed None/Timestamp column to datetime64, turning
+    # None into NaT - pd.isna() is the correct way to check for it
+    assert pd.isna(df.iloc[0]['Date_added'])
+    assert df.iloc[1]['Date_removed'] == 'present'
+
+
+def test_save_master_ticker_list_from_raw_html(tmp_path):
+    """
+    Stage 2: reads a previously-saved raw HTML file from disk and produces
+    master_ticker_list.csv, with no network call needed
+    """
+    # Arrange: a small dummy raw HTML file, as if stage 1 already saved it
+    raw_html_file = tmp_path / "sp500_wikipedia_page.html"
+    raw_html_file.write_text("""
+        <html>
+        <body>
+            <table id="constituents">
+            <tr><th>Symbol</th><th>Security</th></tr>
+            <tr><td>AAPL</td><td>Apple Inc.</td></tr>
+            </table>
+            <table id="changes">
+            <tr>
+                <th>Date</th><th>Added Ticker</th><th>Added Security</th>
+                <th>Removed Ticker</th><th>Removed Security</th><th>Reason</th>
+            </tr>
+            <tr>
+                <td>January 1, 2023</td><td></td><td></td>
+                <td>OLDCO</td><td>Old Co.</td><td>Removed</td>
+            </tr>
+            </table>
+        </body>
+        </html>
+    """, encoding='utf-8')
+    output_file = tmp_path / "master_ticker_list.csv"
+
+    # Act: run stage 2 purely from the local raw file, no network involved
+    result = sp500_constituents.save_master_ticker_list(
+        str(raw_html_file), str(output_file))
+
+    # Assert: master list produced with both the current and historical ticker
+    assert result is True
+    df = pd.read_csv(output_file)
+    assert set(df['Symbol']) == {'AAPL', 'OLDCO'}
+    assert df[df['Symbol'] == 'AAPL'].iloc[0]['Date_removed'] == 'present'
+
+
+def test_save_master_ticker_list_missing_raw_file(tmp_path):
+    """
+    Stage 2 should fail cleanly if stage 1's raw HTML hasn't been saved yet
+    """
+    # Arrange: point at a raw HTML file that doesn't exist
+    missing_file = tmp_path / "does_not_exist.html"
+    output_file = tmp_path / "master_ticker_list.csv"
+
+    # Act: run stage 2 without a stage-1 file present
+    result = sp500_constituents.save_master_ticker_list(
+        str(missing_file), str(output_file))
+
+    # Assert: fails cleanly, no output written
+    assert result is False
+    assert not output_file.exists()
