@@ -1,3 +1,4 @@
+import os
 import requests
 import pandas as pd
 import io
@@ -80,6 +81,24 @@ def get_historical_sp500(target_date, current_tickers, changes_df):
             historical_tickers.add(removed)
 
     return sorted(list(historical_tickers))
+
+
+def save_raw_wiki_html(output_file=os.path.join("data", "1_raw", "wiki", "sp500_wikipedia_page.html")):
+    """
+    Stage 1 (raw ingest / Bronze layer): hit Wikipedia and save the HTML
+    exactly as returned, no parsing. Downstream steps re-read this local
+    file instead of hitting the network again.
+    """
+    is_connected, html_content = check_wiki_connection()
+    if not is_connected:
+        print("Failed to connect to Wikipedia")
+        return False
+
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write(html_content)
+
+    return True
 
 
 def get_sp500_tickers_by_date(target_date):

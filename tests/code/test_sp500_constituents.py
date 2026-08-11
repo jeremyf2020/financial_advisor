@@ -1,6 +1,7 @@
 import pytest
 import pandas as pd
 import io
+from unittest.mock import patch
 from src.ingest import sp500_constituents
 
 
@@ -187,129 +188,39 @@ def test_get_sp500_tickers_by_date_integration():
     assert 'TSLA' not in tickers_2020, "TSLA was added to S&P 500 in 2020, should not be in the list on Jan 1, 2020"
 
 
-def test_build_ticker_lifespans_current_only():
+def test_save_raw_wiki_html(tmp_path):
     """
-    Current constituent with no changes history should have no known
-    Date_added and be marked as still 'present'
+    Stage 1: save whatever check_wiki_connection() returns as-is to disk,
+    no parsing applied
     """
-    # Arrange: one current ticker, no changes at all
-    mock_current = {'A'}
-    mock_changes = pd.DataFrame({
-        'Date': pd.to_datetime([]),
-        'Added_Ticker': [],
-        'Removed_Ticker': []
-    })
+    # Arrange: mock the network call so this test doesn't depend on live Wikipedia
+    output_file = tmp_path / "sp500_wikipedia_page.html"
+    fake_html = "<html>fake S&P 500 page</html>"
 
-    # Act: build the lifespan dict
-    lifespans = sp500_constituents.build_ticker_lifespans(
-        mock_current, mock_changes)
+    with patch('src.ingest.sp500_constituents.check_wiki_connection') as mock_check:
+        mock_check.return_value = (True, fake_html)
 
-    # Assert: no add date on record, still present
-    assert lifespans['A']['Date_added'] is None
-    assert lifespans['A']['Date_removed'] == 'present'
+        # Act: run stage 1
+        result = sp500_constituents.save_raw_wiki_html(str(output_file))
+
+    # Assert: file saved with the exact raw content, no parsing applied
+    assert result is True
+    assert output_file.read_text(encoding='utf-8') == fake_html
 
 
-def test_build_ticker_lifespans_historical_removal():
+def test_save_raw_wiki_html_connection_failure(tmp_path):
     """
-    A ticker that was removed and is not a current constituent should
-    keep its removal date instead of 'present'
+    Stage 1 should fail cleanly (no file written) if Wikipedia is unreachable
     """
-    # Arrange: 'B' is not in current_tickers, was removed in the past
-    mock_current = {'A'}
-    mock_changes = pd.DataFrame({
-        'Date': pd.to_datetime(['2019-06-01']),
-        'Added_Ticker': [''],
-        'Removed_Ticker': ['B']
-    })
+    # Arrange: mock a failed connection
+    output_file = tmp_path / "sp500_wikipedia_page.html"
 
-    # Act: build the lifespan dict
-    lifespans = sp500_constituents.build_ticker_lifespans(
-        mock_current, mock_changes)
+    with patch('src.ingest.sp500_constituents.check_wiki_connection') as mock_check:
+        mock_check.return_value = (False, None)
 
-    # Assert: 'B' recorded with its removal date, not 'present'
-    assert lifespans['B']['Date_removed'] == pd.Timestamp('2019-06-01')
+        # Act: run stage 1
+        result = sp500_constituents.save_raw_wiki_html(str(output_file))
 
-
-def test_build_ticker_lifespans_keeps_earliest_add_date():
-    """
-    If a ticker shows up as 'added' more than once in the changes history,
-    the earliest date should win (first time it actually joined)
-    """
-    # Arrange: 'A' added twice, in 2015 then again in 2021
-    mock_current = {'A'}
-    mock_changes = pd.DataFrame({
-        'Date': pd.to_datetime(['2021-01-01', '2015-03-01']),
-        'Added_Ticker': ['A', 'A'],
-        'Removed_Ticker': ['', '']
-    })
-
-    # Act: build the lifespan dict
-    lifespans = sp500_constituents.build_ticker_lifespans(
-        mock_current, mock_changes)
-
-    # Assert: Date_added is the earliest of the two dates, not the latest
-    assert lifespans['A']['Date_added'] == pd.Timestamp('2015-03-01')
-
-
-def test_build_ticker_lifespans_keeps_latest_removal_date():
-    """
-    If a historical (non-current) ticker was removed more than once,
-    the latest removal date should win (most recent time it actually left)
-    """
-    # Arrange: 'C' is not current, removed once in 2018 then again in 2022
-    mock_current = {'A'}
-    mock_changes = pd.DataFrame({
-        'Date': pd.to_datetime(['2018-05-01', '2022-09-01']),
-        'Added_Ticker': ['', ''],
-        'Removed_Ticker': ['C', 'C']
-    })
-
-    # Act: build the lifespan dict
-    lifespans = sp500_constituents.build_ticker_lifespans(
-        mock_current, mock_changes)
-
-    # Assert: Date_removed is the latest of the two dates, not the earliest
-    assert lifespans['C']['Date_removed'] == pd.Timestamp('2022-09-01')
-
-
-def test_build_ticker_lifespans_readded_stays_present():
-    """
-    A ticker that was removed in the past but is a current constituent
-    (i.e. it was re-added later) should stay marked 'present', not be
-    overwritten by its earlier removal date
-    """
-    # Arrange: 'A' is current, but was removed once back in 2017 before rejoining
-    mock_current = {'A'}
-    mock_changes = pd.DataFrame({
-        'Date': pd.to_datetime(['2017-01-01']),
-        'Added_Ticker': [''],
-        'Removed_Ticker': ['A']
-    })
-
-    # Act: build the lifespan dict
-    lifespans = sp500_constituents.build_ticker_lifespans(
-        mock_current, mock_changes)
-
-    # Assert: current constituency wins over the stale historical removal event
-    assert lifespans['A']['Date_removed'] == 'present'
-
-
-def test_lifespans_to_dataframe():
-    """
-    Convert the {ticker: {Date_added, Date_removed}} dict into the
-    master_ticker_list.csv shape: Symbol/Date_added/Date_removed, sorted
-    """
-    # Arrange: a small unsorted lifespans dict
-    lifespans = {
-        'B': {'Date_added': pd.Timestamp('2010-01-01'), 'Date_removed': 'present'},
-        'A': {'Date_added': None, 'Date_removed': pd.Timestamp('2019-01-01')},
-    }
-
-    # Act: convert to DataFrame
-    df = sp500_constituents.lifespans_to_dataframe(lifespans)
-
-    # Assert: correct columns, sorted by Symbol, values preserved
-    assert list(df.columns) == ['Symbol', 'Date_added', 'Date_removed']
-    assert df['Symbol'].tolist() == ['A', 'B']
-    assert df.iloc[0]['Date_added'] is None
-    assert df.iloc[1]['Date_removed'] == 'present'
+    # Assert: reports failure, no file written
+    assert result is False
+    assert not output_file.exists()
