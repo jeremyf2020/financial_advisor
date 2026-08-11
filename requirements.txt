@@ -1,0 +1,14 @@
+# === Data ===
+pandas==3.0.3
+requests
+
+# === Web Scraping (S&P 500 constituents) ===
+lxml
+html5lib
+
+# === Config / Secrets ===
+python-dotenv
+
+# === Testing ===
+pytest==9.0.3
+pytest-cov==7.1.0
