@@ -150,3 +150,31 @@ def build_metadata_tables(tickers_df, wiki_sector_map, cik_lookup=None, sec_user
     rejected_df = pd.DataFrame(rejected_rows)
 
     return valid_df, rejected_df
+
+
+if __name__ == "__main__":
+    from src.ingest import sp500_constituents as constituents
+
+    master_list = os.path.join("data", "2_processed", "master_ticker_list.csv")
+    raw_html_file = os.path.join(
+        "data", "1_raw", "wiki", "sp500_wikipedia_page.html")
+
+    tickers_df = pd.read_csv(master_list)
+
+    with open(raw_html_file, encoding="utf-8") as f:
+        wiki_sector_map = constituents.extract_current_sector_map(f.read())
+
+    print("Fetching SEC EDGAR CIK lookup...")
+    cik_lookup = fetch_cik_lookup()
+
+    print(f"Classifying {len(tickers_df)} tickers "
+          f"({len(wiki_sector_map)} covered by Wikipedia for free)...")
+    valid_df, rejected_df = build_metadata_tables(
+        tickers_df, wiki_sector_map, cik_lookup=cik_lookup)
+
+    output_dir = os.path.join("data", "2_processed")
+    valid_df.to_csv(os.path.join(output_dir, "stock_metadata.csv"), index=False)
+    rejected_df.to_csv(os.path.join(
+        output_dir, "delisted_stocks_to_scan.csv"), index=False)
+
+    print(f"Valid: {len(valid_df)}, Manual review needed: {len(rejected_df)}")
