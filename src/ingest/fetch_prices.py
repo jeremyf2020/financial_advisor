@@ -28,7 +28,12 @@ def download_single_ticker(ticker, start_date, end_date, output_dir, api_key=Non
         "fmt": "json",
     }
 
-    response = requests.get(url, params=params, timeout=10)
+    try:
+        response = requests.get(url, params=params, timeout=20)
+    except requests.exceptions.RequestException as e:
+        print(f"!! [{ticker}] Request failed: {e}")
+        return False
+
     if response.status_code != 200:
         return False
 
@@ -78,3 +83,16 @@ def download_all_tickers(tickers, start_date, end_date, output_dir, api_key=None
         time.sleep(rate_limit_seconds)
 
     return success_count
+
+
+if __name__ == "__main__":
+    master_list = os.path.join("data", "2_processed", "master_ticker_list.csv")
+    tickers_df = pd.read_csv(master_list)
+    tickers = tickers_df['Symbol'].tolist()
+
+    end_date = pd.Timestamp.today().strftime("%Y-%m-%d")
+    output_dir = os.path.join("data", "1_raw", "prices")
+
+    print(f"Downloading {len(tickers)} tickers to {output_dir}...")
+    count = download_all_tickers(tickers, "1990-01-01", end_date, output_dir)
+    print(f"Done: {count}/{len(tickers)} succeeded")

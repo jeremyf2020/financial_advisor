@@ -84,6 +84,26 @@ def test_download_single_ticker_api_error(tmp_path):
     assert not (tmp_path / "DELISTED.csv").exists()
 
 
+def test_download_single_ticker_network_timeout(tmp_path):
+    """
+    A network-level failure (timeout, connection reset, etc.) should fail
+    cleanly and return False, not raise - so a single flaky ticker doesn't
+    crash a batch download_all_tickers() run partway through
+    """
+    # Arrange: mock requests.get raising a timeout, as it does on a slow/dead connection
+    import requests as requests_module
+
+    # Act
+    with patch('src.ingest.fetch_prices.requests.get',
+               side_effect=requests_module.exceptions.ReadTimeout("timed out")):
+        result = fetch_prices.download_single_ticker(
+            "SLOW", "2024-01-01", "2024-01-03", str(tmp_path), api_key="fake_key")
+
+    # Assert: reports failure, nothing saved, no exception propagated
+    assert result is False
+    assert not (tmp_path / "SLOW.csv").exists()
+
+
 def test_download_single_ticker_empty_response(tmp_path):
     """
     An empty JSON array (ticker exists but no data in the requested range)
