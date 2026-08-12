@@ -1,6 +1,7 @@
 # === Data ===
 pandas==3.0.3
 requests
+yfinance==1.4.1
 
 # === Web Scraping (S&P 500 constituents) ===
 lxml
