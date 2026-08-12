@@ -70,6 +70,87 @@ def test_parse_sp500_mock_tables():
     assert changes.iloc[0]['Removed_Ticker'] == 'C'
 
 
+def test_parse_sp500_tables_missing_changes_table():
+    """
+    A page that renders without the changes table (Wikipedia does this
+    intermittently) should raise ValueError, not silently misparse a
+    different table as if it were the changes table
+    """
+    # Arrange: constituents table present, but no Ticker+Date changes table
+    dummy_html = """
+        <html>
+        <body>
+            <table id="constituents">
+            <tr><th>Symbol</th><th>Security</th></tr>
+            <tr><td>AAPL</td><td>Apple Inc.</td></tr>
+            </table>
+            <table id="sector-nav">
+            <tr><th>Energy</th><th>Materials</th></tr>
+            <tr><td>Some Company</td><td>Another Company</td></tr>
+            </table>
+        </body>
+        </html>
+    """
+
+    # Act / Assert: parsing raises rather than mis-reading the nav table as changes
+    with pytest.raises(ValueError, match="changes table"):
+        sp500_constituents.parse_sp500_tables(dummy_html)
+
+
+def test_parse_sp500_tables_missing_constituents_table():
+    """ A page with no Symbol column at all should raise ValueError """
+    # Arrange: only a changes-shaped table, no constituents table
+    dummy_html = """
+        <html>
+        <body>
+            <table id="changes">
+            <tr><th>Date</th><th>Added Ticker</th><th>Removed Ticker</th></tr>
+            <tr><td>January 1, 2023</td><td>B</td><td>C</td></tr>
+            </table>
+        </body>
+        </html>
+    """
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="constituents table"):
+        sp500_constituents.parse_sp500_tables(dummy_html)
+
+
+def test_extract_current_sector_map():
+    """
+    GICS Sector / Sub-Industry should be parsed from the constituents table
+    for free, for tickers that are current S&P 500 members
+    """
+    # Arrange: dummy HTML with the real GICS Sector / Sub-Industry columns
+    dummy_html = """
+        <html>
+        <body>
+            <table id="constituents">
+            <tr><th>Symbol</th><th>Security</th><th>GICS Sector</th><th>GICS Sub-Industry</th></tr>
+            <tr><td>AAPL</td><td>Apple Inc.</td><td>Information Technology</td><td>Technology Hardware, Storage &amp; Peripherals</td></tr>
+            <tr><td>BRK.B</td><td>Berkshire Hathaway</td><td>Financials</td><td>Multi-Sector Holdings</td></tr>
+            </table>
+            <table id="changes">
+            <tr>
+                <th>Date</th><th>Added Ticker</th><th>Added Security</th>
+                <th>Removed Ticker</th><th>Removed Security</th><th>Reason</th>
+            </tr>
+            <tr><td>January 1, 2023</td><td>B</td><td>Company B</td><td>C</td><td>Company C</td><td>Merger</td></tr>
+            </table>
+        </body>
+        </html>
+    """
+
+    # Act: extract the sector map
+    sector_map = sp500_constituents.extract_current_sector_map(dummy_html)
+
+    # Assert: correct sector/industry, and '.' -> '-' conversion applied to the key
+    assert sector_map['AAPL']['Sector'] == 'Information Technology'
+    assert sector_map['BRK-B']['Sector'] == 'Financials'
+    assert sector_map['BRK-B']['Industry'] == 'Multi-Sector Holdings'
+    assert sector_map['BRK-B']['Name'] == 'Berkshire Hathaway'
+
+
 def test_parse_sp500_tables():
     """
     Integration Test: Test parsing HTML into SET/DF with real Wikipedia content,
@@ -188,24 +269,56 @@ def test_get_sp500_tickers_by_date_integration():
     assert 'TSLA' not in tickers_2020, "TSLA was added to S&P 500 in 2020, should not be in the list on Jan 1, 2020"
 
 
+VALID_DUMMY_WIKI_HTML = """
+    <html>
+    <body>
+        <table id="constituents">
+        <tr><th>Symbol</th><th>Security</th></tr>
+        <tr><td>AAPL</td><td>Apple Inc.</td></tr>
+        </table>
+        <table id="changes">
+        <tr><th>Date</th><th>Added Ticker</th><th>Added Security</th>
+            <th>Removed Ticker</th><th>Removed Security</th><th>Reason</th></tr>
+        <tr><td>January 1, 2023</td><td>B</td><td>Company B</td><td>C</td><td>Company C</td><td>Merger</td></tr>
+        </table>
+    </body>
+    </html>
+"""
+
+INCOMPLETE_DUMMY_WIKI_HTML = """
+    <html>
+    <body>
+        <table id="constituents">
+        <tr><th>Symbol</th><th>Security</th></tr>
+        <tr><td>AAPL</td><td>Apple Inc.</td></tr>
+        </table>
+        <table id="sector-nav">
+        <tr><th>Energy</th><th>Materials</th></tr>
+        <tr><td>Some Company</td><td>Another Company</td></tr>
+        </table>
+    </body>
+    </html>
+"""
+
+
 def test_save_raw_wiki_html(tmp_path):
     """
     Stage 1: save whatever check_wiki_connection() returns as-is to disk,
-    no parsing applied
+    no parsing applied to the saved content itself (only used to validate
+    the page is complete before saving)
     """
     # Arrange: mock the network call so this test doesn't depend on live Wikipedia
     output_file = tmp_path / "sp500_wikipedia_page.html"
-    fake_html = "<html>fake S&P 500 page</html>"
 
     with patch('src.ingest.sp500_constituents.check_wiki_connection') as mock_check:
-        mock_check.return_value = (True, fake_html)
+        mock_check.return_value = (True, VALID_DUMMY_WIKI_HTML)
 
         # Act: run stage 1
         result = sp500_constituents.save_raw_wiki_html(str(output_file))
 
-    # Assert: file saved with the exact raw content, no parsing applied
+    # Assert: file saved with the exact raw content, no parsing applied to it
     assert result is True
-    assert output_file.read_text(encoding='utf-8') == fake_html
+    assert output_file.read_text(encoding='utf-8') == VALID_DUMMY_WIKI_HTML
 
 
 def test_save_raw_wiki_html_connection_failure(tmp_path):
@@ -219,11 +332,54 @@ def test_save_raw_wiki_html_connection_failure(tmp_path):
         mock_check.return_value = (False, None)
 
         # Act: run stage 1
-        result = sp500_constituents.save_raw_wiki_html(str(output_file))
+        result = sp500_constituents.save_raw_wiki_html(str(output_file), max_retries=2)
 
     # Assert: reports failure, no file written
     assert result is False
     assert not output_file.exists()
+
+
+def test_save_raw_wiki_html_retries_on_incomplete_page(tmp_path):
+    """
+    If the first fetch comes back without a changes table (Wikipedia does
+    this intermittently), stage 1 should retry rather than save a broken page
+    """
+    # Arrange: first call returns an incomplete page, second call a valid one
+    output_file = tmp_path / "sp500_wikipedia_page.html"
+
+    with patch('src.ingest.sp500_constituents.check_wiki_connection') as mock_check:
+        mock_check.side_effect = [
+            (True, INCOMPLETE_DUMMY_WIKI_HTML),
+            (True, VALID_DUMMY_WIKI_HTML),
+        ]
+
+        # Act
+        result = sp500_constituents.save_raw_wiki_html(str(output_file), max_retries=3)
+
+    # Assert: succeeded on the second attempt, saved the valid page
+    assert result is True
+    assert output_file.read_text(encoding='utf-8') == VALID_DUMMY_WIKI_HTML
+    assert mock_check.call_count == 2
+
+
+def test_save_raw_wiki_html_gives_up_after_max_retries(tmp_path):
+    """
+    If every attempt comes back incomplete, stage 1 should give up after
+    max_retries and not save anything
+    """
+    # Arrange: every call returns an incomplete page
+    output_file = tmp_path / "sp500_wikipedia_page.html"
+
+    with patch('src.ingest.sp500_constituents.check_wiki_connection') as mock_check:
+        mock_check.return_value = (True, INCOMPLETE_DUMMY_WIKI_HTML)
+
+        # Act
+        result = sp500_constituents.save_raw_wiki_html(str(output_file), max_retries=3)
+
+    # Assert: gave up, nothing saved, tried exactly max_retries times
+    assert result is False
+    assert not output_file.exists()
+    assert mock_check.call_count == 3
 
 
 def test_build_ticker_lifespans_current_only():
@@ -331,6 +487,31 @@ def test_build_ticker_lifespans_readded_stays_present():
 
     # Assert: current constituency wins over the stale historical removal event
     assert lifespans['A']['Date_removed'] == 'present'
+
+
+def test_build_ticker_lifespans_added_then_removed_not_current():
+    """
+    Regression test: a ticker that was added and later removed, and is NOT
+    a current constituent, must NOT end up as 'present'. Real-world case:
+    AAL was added 2015-03-23 and removed 2024-09-23 (replaced by PLTR) -
+    the add event used to default Date_removed to 'present', which then
+    blocked the later remove event from ever updating it.
+    """
+    # Arrange: 'AAL' is not current; added in 2015, removed in 2024
+    mock_current = {'PLTR'}
+    mock_changes = pd.DataFrame({
+        'Date': pd.to_datetime(['2015-03-23', '2024-09-23']),
+        'Added_Ticker': ['AAL', 'PLTR'],
+        'Removed_Ticker': ['AGN', 'AAL']
+    })
+
+    # Act: build the lifespan dict
+    lifespans = sp500_constituents.build_ticker_lifespans(
+        mock_current, mock_changes)
+
+    # Assert: the later removal actually took effect, not stuck on 'present'
+    assert lifespans['AAL']['Date_added'] == pd.Timestamp('2015-03-23')
+    assert lifespans['AAL']['Date_removed'] == pd.Timestamp('2024-09-23')
 
 
 def test_lifespans_to_dataframe():
