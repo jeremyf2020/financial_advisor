@@ -5,6 +5,44 @@ from unittest.mock import patch
 from src.ingest import sp500_constituents
 
 
+VALID_CONSTITUENTS_HTML = """
+    <html>
+    <body>
+        <table id="constituents">
+        <tr><th>Symbol</th><th>Security</th></tr>
+        <tr><td>AAPL</td><td>Apple Inc.</td></tr>
+        <tr><td>BRK.B</td><td>Berkshire</td></tr>
+        </table>
+    </body>
+    </html>
+"""
+
+VALID_CHANGES_HTML = """
+    <html>
+    <body>
+        <table id="changes">
+        <tr><th>Date</th><th>Added Ticker</th><th>Added Security</th>
+            <th>Removed Ticker</th><th>Removed Security</th><th>Reason</th></tr>
+        <tr><td>January 1, 2023</td><td>B</td><td>Company B</td><td>C</td><td>Company C</td><td>Merger</td></tr>
+        </table>
+    </body>
+    </html>
+"""
+
+# Neither a 'Symbol' column nor a Ticker+Date column - matches neither page's
+# expected shape, used to simulate Wikipedia rendering incompletely
+INVALID_WIKI_HTML = """
+    <html>
+    <body>
+        <table id="sector-nav">
+        <tr><th>Energy</th><th>Materials</th></tr>
+        <tr><td>Some Company</td><td>Another Company</td></tr>
+        </table>
+    </body>
+    </html>
+"""
+
+
 def test_check_wiki_connection():
     """
     Test connection to Wikipedia and ensure that the function
@@ -25,39 +63,9 @@ def test_parse_sp500_mock_tables():
     ensuring the parsing logic correctly extracts tickers and changes
     and handles the '.' to '-' conversion for tickers
     """
-    # Arrange: build a small dummy HTML page with a constituents table and a changes table
-    dummy_html = """
-        <html>
-        <body>
-            <table id="constituents">
-            <tr><th>Symbol</th><th>Security</th></tr>
-            <tr><td>AAPL</td><td>Apple Inc.</td></tr>
-            <tr><td>BRK.B</td><td>Berkshire</td></tr>
-            </table>
-            <table id="changes">
-            <tr>
-                <th>Date</th>
-                <th>Added Ticker</th>
-                <th>Added Security</th>
-                <th>Removed Ticker</th>
-                <th>Removed Security</th>
-                <th>Reason</th>
-            </tr>
-            <tr>
-                <td>January 1, 2023</td>
-                <td>B</td>
-                <td>Company B</td>
-                <td>C</td>
-                <td>Company C</td>
-                <td>Merger</td>
-            </tr>
-            </table>
-        </body>
-        </html>
-    """
-
-    # Act: parse the dummy HTML into current tickers (set) + changes (DataFrame)
-    current, changes = sp500_constituents.parse_sp500_tables(dummy_html)
+    # Act: parse the two dummy pages into current tickers (set) + changes (DataFrame)
+    current, changes = sp500_constituents.parse_sp500_tables(
+        VALID_CONSTITUENTS_HTML, VALID_CHANGES_HTML)
 
     # Assert: tickers parsed correctly (incl. '.' -> '-' conversion) and the changes row is correct
     assert 'AAPL' in current
@@ -70,50 +78,20 @@ def test_parse_sp500_mock_tables():
     assert changes.iloc[0]['Removed_Ticker'] == 'C'
 
 
-def test_parse_sp500_tables_missing_changes_table():
-    """
-    A page that renders without the changes table (Wikipedia does this
-    intermittently) should raise ValueError, not silently misparse a
-    different table as if it were the changes table
-    """
-    # Arrange: constituents table present, but no Ticker+Date changes table
-    dummy_html = """
-        <html>
-        <body>
-            <table id="constituents">
-            <tr><th>Symbol</th><th>Security</th></tr>
-            <tr><td>AAPL</td><td>Apple Inc.</td></tr>
-            </table>
-            <table id="sector-nav">
-            <tr><th>Energy</th><th>Materials</th></tr>
-            <tr><td>Some Company</td><td>Another Company</td></tr>
-            </table>
-        </body>
-        </html>
-    """
-
-    # Act / Assert: parsing raises rather than mis-reading the nav table as changes
-    with pytest.raises(ValueError, match="changes table"):
-        sp500_constituents.parse_sp500_tables(dummy_html)
-
-
-def test_parse_sp500_tables_missing_constituents_table():
+def test_parse_current_constituents_missing_table():
     """ A page with no Symbol column at all should raise ValueError """
-    # Arrange: only a changes-shaped table, no constituents table
-    dummy_html = """
-        <html>
-        <body>
-            <table id="changes">
-            <tr><th>Date</th><th>Added Ticker</th><th>Removed Ticker</th></tr>
-            <tr><td>January 1, 2023</td><td>B</td><td>C</td></tr>
-            </table>
-        </body>
-        </html>
-    """
-
-    # Act / Assert
     with pytest.raises(ValueError, match="constituents table"):
-        sp500_constituents.parse_sp500_tables(dummy_html)
+        sp500_constituents.parse_current_constituents(INVALID_WIKI_HTML)
+
+
+def test_parse_changes_table_missing_table():
+    """
+    A page that renders without the changes table (Wikipedia moved this to
+    a separate article and occasionally serves it incompletely) should
+    raise ValueError, not silently misparse a different table as changes
+    """
+    with pytest.raises(ValueError, match="changes table"):
+        sp500_constituents.parse_changes_table(INVALID_WIKI_HTML)
 
 
 def test_extract_current_sector_map():
@@ -129,13 +107,6 @@ def test_extract_current_sector_map():
             <tr><th>Symbol</th><th>Security</th><th>GICS Sector</th><th>GICS Sub-Industry</th></tr>
             <tr><td>AAPL</td><td>Apple Inc.</td><td>Information Technology</td><td>Technology Hardware, Storage &amp; Peripherals</td></tr>
             <tr><td>BRK.B</td><td>Berkshire Hathaway</td><td>Financials</td><td>Multi-Sector Holdings</td></tr>
-            </table>
-            <table id="changes">
-            <tr>
-                <th>Date</th><th>Added Ticker</th><th>Added Security</th>
-                <th>Removed Ticker</th><th>Removed Security</th><th>Reason</th>
-            </tr>
-            <tr><td>January 1, 2023</td><td>B</td><td>Company B</td><td>C</td><td>Company C</td><td>Merger</td></tr>
             </table>
         </body>
         </html>
@@ -153,16 +124,21 @@ def test_extract_current_sector_map():
 
 def test_parse_sp500_tables():
     """
-    Integration Test: Test parsing HTML into SET/DF with real Wikipedia content,
-    test 2 functions: check_wiki_connection() + parse_sp500_tables()
+    Integration Test: Test parsing HTML into SET/DF with real Wikipedia
+    content, across the two separate pages (constituents + historical changes)
     """
-    # Arrange: fetch the real Wikipedia HTML to parse against
-    is_connected, html_content = sp500_constituents.check_wiki_connection()
-    assert is_connected is True, "Failed to connect to Wikipedia, Test cannot proceed"
+    # Arrange: fetch both real Wikipedia pages to parse against
+    is_connected, constituents_html = sp500_constituents.check_wiki_connection(
+        sp500_constituents.CONSTITUENTS_URL)
+    assert is_connected is True, "Failed to connect to Wikipedia (constituents), test cannot proceed"
+
+    is_connected2, changes_html = sp500_constituents.check_wiki_connection(
+        sp500_constituents.HISTORICAL_CHANGES_URL)
+    assert is_connected2 is True, "Failed to connect to Wikipedia (historical changes), test cannot proceed"
 
     # Act: parse the live HTML into current tickers (set) + changes (DataFrame)
     current_tickers, changes_df = sp500_constituents.parse_sp500_tables(
-        html_content)
+        constituents_html, changes_html)
 
     # Assert: current tickers form a ~500-ticker set, changes_df has the expected shape
     assert isinstance(current_tickers, set), "The list should be a Set"
@@ -269,97 +245,80 @@ def test_get_sp500_tickers_by_date_integration():
     assert 'TSLA' not in tickers_2020, "TSLA was added to S&P 500 in 2020, should not be in the list on Jan 1, 2020"
 
 
-VALID_DUMMY_WIKI_HTML = """
-    <html>
-    <body>
-        <table id="constituents">
-        <tr><th>Symbol</th><th>Security</th></tr>
-        <tr><td>AAPL</td><td>Apple Inc.</td></tr>
-        </table>
-        <table id="changes">
-        <tr><th>Date</th><th>Added Ticker</th><th>Added Security</th>
-            <th>Removed Ticker</th><th>Removed Security</th><th>Reason</th></tr>
-        <tr><td>January 1, 2023</td><td>B</td><td>Company B</td><td>C</td><td>Company C</td><td>Merger</td></tr>
-        </table>
-    </body>
-    </html>
-"""
-
-INCOMPLETE_DUMMY_WIKI_HTML = """
-    <html>
-    <body>
-        <table id="constituents">
-        <tr><th>Symbol</th><th>Security</th></tr>
-        <tr><td>AAPL</td><td>Apple Inc.</td></tr>
-        </table>
-        <table id="sector-nav">
-        <tr><th>Energy</th><th>Materials</th></tr>
-        <tr><td>Some Company</td><td>Another Company</td></tr>
-        </table>
-    </body>
-    </html>
-"""
-
-
 def test_save_raw_wiki_html(tmp_path):
     """
-    Stage 1: save whatever check_wiki_connection() returns as-is to disk,
-    no parsing applied to the saved content itself (only used to validate
-    the page is complete before saving)
+    Stage 1: save both the constituents page and the historical changes
+    page exactly as returned, no parsing applied to the saved content
+    itself (only used to validate each page is complete before saving)
     """
-    # Arrange: mock the network call so this test doesn't depend on live Wikipedia
+    # Arrange: mock the network calls so this test doesn't depend on live Wikipedia
     output_file = tmp_path / "sp500_wikipedia_page.html"
+    changes_output_file = tmp_path / "sp500_historical_changes.html"
 
     with patch('src.ingest.sp500_constituents.check_wiki_connection') as mock_check:
-        mock_check.return_value = (True, VALID_DUMMY_WIKI_HTML)
+        mock_check.side_effect = [
+            (True, VALID_CONSTITUENTS_HTML),
+            (True, VALID_CHANGES_HTML),
+        ]
 
         # Act: run stage 1
-        result = sp500_constituents.save_raw_wiki_html(str(output_file))
+        result = sp500_constituents.save_raw_wiki_html(
+            str(output_file), str(changes_output_file))
 
-    # Assert: file saved with the exact raw content, no parsing applied to it
+    # Assert: both files saved with their exact raw content
     assert result is True
-    assert output_file.read_text(encoding='utf-8') == VALID_DUMMY_WIKI_HTML
+    assert output_file.read_text(encoding='utf-8') == VALID_CONSTITUENTS_HTML
+    assert changes_output_file.read_text(
+        encoding='utf-8') == VALID_CHANGES_HTML
 
 
 def test_save_raw_wiki_html_connection_failure(tmp_path):
     """
-    Stage 1 should fail cleanly (no file written) if Wikipedia is unreachable
+    Stage 1 should fail cleanly (no files written) if Wikipedia is unreachable
     """
     # Arrange: mock a failed connection
     output_file = tmp_path / "sp500_wikipedia_page.html"
+    changes_output_file = tmp_path / "sp500_historical_changes.html"
 
     with patch('src.ingest.sp500_constituents.check_wiki_connection') as mock_check:
         mock_check.return_value = (False, None)
 
         # Act: run stage 1
-        result = sp500_constituents.save_raw_wiki_html(str(output_file), max_retries=2)
+        result = sp500_constituents.save_raw_wiki_html(
+            str(output_file), str(changes_output_file), max_retries=2)
 
-    # Assert: reports failure, no file written
+    # Assert: reports failure, no files written
     assert result is False
     assert not output_file.exists()
+    assert not changes_output_file.exists()
 
 
 def test_save_raw_wiki_html_retries_on_incomplete_page(tmp_path):
     """
-    If the first fetch comes back without a changes table (Wikipedia does
-    this intermittently), stage 1 should retry rather than save a broken page
+    If the first fetch of the constituents page comes back incomplete,
+    stage 1 should retry that page rather than save a broken one
     """
-    # Arrange: first call returns an incomplete page, second call a valid one
+    # Arrange: constituents page fails once then succeeds; changes page succeeds first try
     output_file = tmp_path / "sp500_wikipedia_page.html"
+    changes_output_file = tmp_path / "sp500_historical_changes.html"
 
     with patch('src.ingest.sp500_constituents.check_wiki_connection') as mock_check:
         mock_check.side_effect = [
-            (True, INCOMPLETE_DUMMY_WIKI_HTML),
-            (True, VALID_DUMMY_WIKI_HTML),
+            (True, INVALID_WIKI_HTML),        # constituents attempt 1: fails
+            (True, VALID_CONSTITUENTS_HTML),  # constituents attempt 2: succeeds
+            (True, VALID_CHANGES_HTML),       # changes attempt 1: succeeds
         ]
 
         # Act
-        result = sp500_constituents.save_raw_wiki_html(str(output_file), max_retries=3)
+        result = sp500_constituents.save_raw_wiki_html(
+            str(output_file), str(changes_output_file), max_retries=3)
 
-    # Assert: succeeded on the second attempt, saved the valid page
+    # Assert: succeeded, saved both valid pages
     assert result is True
-    assert output_file.read_text(encoding='utf-8') == VALID_DUMMY_WIKI_HTML
-    assert mock_check.call_count == 2
+    assert output_file.read_text(encoding='utf-8') == VALID_CONSTITUENTS_HTML
+    assert changes_output_file.read_text(
+        encoding='utf-8') == VALID_CHANGES_HTML
+    assert mock_check.call_count == 3
 
 
 def test_save_raw_wiki_html_gives_up_after_max_retries(tmp_path):
@@ -369,16 +328,19 @@ def test_save_raw_wiki_html_gives_up_after_max_retries(tmp_path):
     """
     # Arrange: every call returns an incomplete page
     output_file = tmp_path / "sp500_wikipedia_page.html"
+    changes_output_file = tmp_path / "sp500_historical_changes.html"
 
     with patch('src.ingest.sp500_constituents.check_wiki_connection') as mock_check:
-        mock_check.return_value = (True, INCOMPLETE_DUMMY_WIKI_HTML)
+        mock_check.return_value = (True, INVALID_WIKI_HTML)
 
         # Act
-        result = sp500_constituents.save_raw_wiki_html(str(output_file), max_retries=3)
+        result = sp500_constituents.save_raw_wiki_html(
+            str(output_file), str(changes_output_file), max_retries=3)
 
-    # Assert: gave up, nothing saved, tried exactly max_retries times
+    # Assert: gave up on the constituents page alone, never even tried the changes page
     assert result is False
     assert not output_file.exists()
+    assert not changes_output_file.exists()
     assert mock_check.call_count == 3
 
 
@@ -539,18 +501,23 @@ def test_lifespans_to_dataframe():
 
 def test_save_master_ticker_list_from_raw_html(tmp_path):
     """
-    Stage 2: reads a previously-saved raw HTML file from disk and produces
-    master_ticker_list.csv, with no network call needed
+    Stage 2: reads the two previously-saved raw HTML files from disk and
+    produces master_ticker_list.csv, with no network call needed
     """
-    # Arrange: a small dummy raw HTML file, as if stage 1 already saved it
+    # Arrange: dummy raw HTML files, as if stage 1 already saved them
     raw_html_file = tmp_path / "sp500_wikipedia_page.html"
     raw_html_file.write_text("""
-        <html>
-        <body>
+        <html><body>
             <table id="constituents">
             <tr><th>Symbol</th><th>Security</th></tr>
             <tr><td>AAPL</td><td>Apple Inc.</td></tr>
             </table>
+        </body></html>
+    """, encoding='utf-8')
+
+    changes_html_file = tmp_path / "sp500_historical_changes.html"
+    changes_html_file.write_text("""
+        <html><body>
             <table id="changes">
             <tr>
                 <th>Date</th><th>Added Ticker</th><th>Added Security</th>
@@ -561,14 +528,14 @@ def test_save_master_ticker_list_from_raw_html(tmp_path):
                 <td>OLDCO</td><td>Old Co.</td><td>Removed</td>
             </tr>
             </table>
-        </body>
-        </html>
+        </body></html>
     """, encoding='utf-8')
+
     output_file = tmp_path / "master_ticker_list.csv"
 
-    # Act: run stage 2 purely from the local raw file, no network involved
+    # Act: run stage 2 purely from the local raw files, no network involved
     result = sp500_constituents.save_master_ticker_list(
-        str(raw_html_file), str(output_file))
+        str(raw_html_file), str(changes_html_file), str(output_file))
 
     # Assert: master list produced with both the current and historical ticker
     assert result is True
@@ -579,15 +546,37 @@ def test_save_master_ticker_list_from_raw_html(tmp_path):
 
 def test_save_master_ticker_list_missing_raw_file(tmp_path):
     """
-    Stage 2 should fail cleanly if stage 1's raw HTML hasn't been saved yet
+    Stage 2 should fail cleanly if stage 1's constituents HTML hasn't been saved yet
     """
-    # Arrange: point at a raw HTML file that doesn't exist
+    # Arrange: constituents file missing, changes file present
     missing_file = tmp_path / "does_not_exist.html"
+    changes_html_file = tmp_path / "sp500_historical_changes.html"
+    changes_html_file.write_text(VALID_CHANGES_HTML, encoding='utf-8')
     output_file = tmp_path / "master_ticker_list.csv"
 
-    # Act: run stage 2 without a stage-1 file present
+    # Act: run stage 2 without a stage-1 constituents file present
     result = sp500_constituents.save_master_ticker_list(
-        str(missing_file), str(output_file))
+        str(missing_file), str(changes_html_file), str(output_file))
+
+    # Assert: fails cleanly, no output written
+    assert result is False
+    assert not output_file.exists()
+
+
+def test_save_master_ticker_list_missing_changes_file(tmp_path):
+    """
+    Stage 2 should fail cleanly if stage 1's historical-changes HTML hasn't
+    been saved yet, even if the constituents HTML is present
+    """
+    # Arrange: constituents file present, changes file missing
+    raw_html_file = tmp_path / "sp500_wikipedia_page.html"
+    raw_html_file.write_text(VALID_CONSTITUENTS_HTML, encoding='utf-8')
+    missing_changes_file = tmp_path / "does_not_exist_changes.html"
+    output_file = tmp_path / "master_ticker_list.csv"
+
+    # Act
+    result = sp500_constituents.save_master_ticker_list(
+        str(raw_html_file), str(missing_changes_file), str(output_file))
 
     # Assert: fails cleanly, no output written
     assert result is False
