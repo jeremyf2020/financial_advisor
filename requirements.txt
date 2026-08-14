@@ -3,6 +3,10 @@ pandas==3.0.3
 requests
 yfinance==1.4.1
 
+# === AI & Machine Learning ===
+xgboost==2.1.4
+scikit-learn==1.6.1
+
 # === Web Scraping (S&P 500 constituents) ===
 lxml
 html5lib
