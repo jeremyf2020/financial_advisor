@@ -1,0 +1,208 @@
+import os
+import pandas as pd
+
+PRICE_PANEL_COLUMNS = ['Date', 'Symbol', 'Open', 'High', 'Low', 'Close', 'Volume']
+
+
+def adjust_ohlc_for_splits(df):
+    """
+    Pure: EODHD only natively split/dividend-adjusts Close - Open/High/Low
+    are left on the raw, unadjusted scale. Mixing an adjusted Close against
+    unadjusted Open/High/Low would produce huge artificial jumps in return
+    calculations around any stock split, so Open/High/Low are scaled by the
+    same (adjusted_close / close) factor to put all four on a consistent
+    basis. No-op if adjusted_close/close aren't both present.
+    """
+    if 'adjusted_close' not in df.columns or 'close' not in df.columns:
+        return df
+
+    result = df.copy()
+    adj_factor = result['adjusted_close'] / result['close']
+    for raw_col in ['open', 'high', 'low']:
+        if raw_col in result.columns:
+            result[raw_col] = result[raw_col] * adj_factor
+
+    return result
+
+
+def load_price_panel(prices_dir):
+    """
+    I/O: read every ticker's EODHD price CSV in prices_dir into one
+    long-format panel DataFrame.
+    """
+    all_prices = []
+
+    for filename in os.listdir(prices_dir):
+        if not filename.endswith(".csv"):
+            continue
+
+        ticker = filename.replace(".csv", "")
+        filepath = os.path.join(prices_dir, filename)
+
+        try:
+            df = pd.read_csv(filepath)
+        except pd.errors.EmptyDataError:
+            continue
+
+        if df.empty or 'date' not in df.columns:
+            continue
+
+        df = adjust_ohlc_for_splits(df)
+
+        df = df.rename(columns={
+            'date': 'Date', 'open': 'Open', 'high': 'High',
+            'low': 'Low', 'adjusted_close': 'Close', 'volume': 'Volume',
+        })
+        df['Date'] = pd.to_datetime(df['Date']).dt.date
+        df['Symbol'] = ticker
+
+        df = df[[c for c in PRICE_PANEL_COLUMNS if c in df.columns]]
+        all_prices.append(df)
+
+    if not all_prices:
+        return pd.DataFrame(columns=PRICE_PANEL_COLUMNS)
+
+    return pd.concat(all_prices, ignore_index=True)
+
+
+def merge_sector_map(price_df, metadata_df):
+    """
+    Pure: attach Sector to the price panel via metadata_df's Symbol->Sector
+    mapping, dropping rows with no known sector or no Close price.
+    """
+    sector_map = dict(zip(metadata_df['Symbol'], metadata_df['Sector']))
+
+    result = price_df.copy()
+    result['Sector'] = result['Symbol'].map(sector_map)
+    result = result.dropna(subset=['Sector', 'Close'])
+
+    return result.sort_values(by=['Symbol', 'Date']).reset_index(drop=True)
+
+
+def compute_momentum_features(price_df, windows=(14, 60)):
+    """
+    Pure: add a Return_Nd column for each window in `windows` - the
+    percentage change in Close over N rows, computed separately per ticker.
+    """
+    result = price_df.copy()
+
+    for window in windows:
+        result[f'Return_{window}d'] = result.groupby(
+            'Symbol')['Close'].pct_change(periods=window)
+
+    return result
+
+
+def compute_sector_rank(price_df, window=60):
+    """
+    Pure: cross-sectional percentile rank of Return_{window}d within each
+    (Date, Sector) group - relative strength vs. sector peers on the same
+    day, not the broad market.
+    """
+    result = price_df.copy()
+    return_col = f'Return_{window}d'
+
+    result[f'Sector_Rank_{window}d'] = result.groupby(
+        ['Date', 'Sector'])[return_col].rank(pct=True, ascending=True)
+
+    return result
+
+
+def compute_forward_returns(price_df, horizon=1):
+    """
+    Pure: T+horizon OHLC returns relative to the current Close - the
+    target variables for the event-driven prediction task.
+    """
+    result = price_df.sort_values(by=['Symbol', 'Date']).copy()
+
+    for col in ['Open', 'High', 'Low', 'Close']:
+        shifted = result.groupby('Symbol')[col].shift(-horizon)
+        result[f'Target_T{horizon}_{col}_Ret'] = (
+            shifted - result['Close']) / result['Close']
+
+    return result
+
+
+def label_spike_event(price_df, threshold=0.02, horizon=1):
+    """
+    Pure: binary label - 1 if the T+horizon High return exceeds
+    `threshold` (a "spike"), 0 otherwise. Crude fixed-threshold labeling;
+    triple-barrier labeling is a planned Phase 2+ replacement for this.
+    """
+    result = price_df.copy()
+    high_col = f'Target_T{horizon}_High_Ret'
+
+    result['Target_Spike_Class'] = (result[high_col] > threshold).astype(int)
+
+    return result
+
+
+def merge_events(price_features_df, earnings_df):
+    """
+    Pure: left-join earnings data onto the price/feature panel on
+    (Symbol, Date), then keep only rows with an actual earnings
+    announcement that day - the defining step of the event-driven design,
+    reducing a full daily panel to only the days the model may act on.
+    """
+    earnings_clean = earnings_df.drop_duplicates(
+        subset=['Symbol', 'Date']).copy()
+    earnings_clean['Date'] = pd.to_datetime(earnings_clean['Date']).dt.date
+
+    merged = pd.merge(price_features_df, earnings_clean,
+                       on=['Symbol', 'Date'], how='left')
+
+    return merged.dropna(subset=['Surprise(%)'])
+
+
+def generate_earnings_driven_features(
+    prices_dir=os.path.join("data", "1_raw", "prices"),
+    metadata_file=os.path.join("data", "2_processed", "stock_metadata.csv"),
+    earnings_file=os.path.join(
+        "data", "1_raw", "earnings", "sp500_historical_earnings.csv"),
+    output_file=os.path.join(
+        "data", "3_features", "event_driven_features.csv"),
+    momentum_windows=(14, 60),
+    sector_rank_window=60,
+    forward_horizon=1,
+    spike_threshold=0.02,
+):
+    """
+    Orchestrator: wire load_price_panel -> merge_sector_map ->
+    compute_momentum_features -> compute_sector_rank ->
+    compute_forward_returns -> label_spike_event -> merge_events, then
+    write the final event-driven feature table to output_file.
+    """
+    metadata_df = pd.read_csv(metadata_file)
+    earnings_df = pd.read_csv(earnings_file)
+
+    price_df = load_price_panel(prices_dir)
+    price_df = merge_sector_map(price_df, metadata_df)
+    price_df = compute_momentum_features(price_df, momentum_windows)
+    price_df = compute_sector_rank(price_df, sector_rank_window)
+    price_df = compute_forward_returns(price_df, forward_horizon)
+    price_df = label_spike_event(price_df, spike_threshold, forward_horizon)
+
+    event_df = merge_events(price_df, earnings_df)
+    event_df = event_df.dropna(subset=[
+        f'Return_{sector_rank_window}d', f'Target_T{forward_horizon}_High_Ret'])
+
+    final_cols = [
+        'Date', 'Symbol', 'Sector', 'Close', 'Volume',
+        'EPS Estimate', 'Reported EPS', 'Surprise(%)',
+        'Return_14d', f'Return_{sector_rank_window}d', f'Sector_Rank_{sector_rank_window}d',
+        f'Target_T{forward_horizon}_Open_Ret', f'Target_T{forward_horizon}_High_Ret',
+        f'Target_T{forward_horizon}_Low_Ret', f'Target_T{forward_horizon}_Close_Ret',
+        'Target_Spike_Class',
+    ]
+    final_cols = [c for c in final_cols if c in event_df.columns]
+    final_df = event_df[final_cols].sort_values(by=['Date', 'Symbol'])
+
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    final_df.to_csv(output_file, index=False)
+
+    return final_df
+
+
+if __name__ == "__main__":
+    df = generate_earnings_driven_features()
+    print(f"Generated {len(df)} event-driven feature rows")
