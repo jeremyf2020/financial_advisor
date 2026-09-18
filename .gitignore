@@ -4,4 +4,3 @@ __pycache__/
 .env
 data/
 *.egg-info/
-TDD_REWRITE_PLAN.md

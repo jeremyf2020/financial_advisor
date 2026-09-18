@@ -6,11 +6,15 @@ yfinance==1.4.1
 # === AI & Machine Learning ===
 xgboost==2.1.4
 scikit-learn==1.6.1
+shap==0.51.0
 
 # === Reporting ===
 matplotlib==3.10.7
 jupyterlab==4.5.1
 ipykernel==7.1.0
+
+# === Web ===
+joblib==1.5.3
 
 # === Web Scraping (S&P 500 constituents) ===
 lxml
