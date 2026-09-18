@@ -14,7 +14,10 @@ jupyterlab==4.5.1
 ipykernel==7.1.0
 
 # === Web ===
+fastapi==0.141.1
+uvicorn[standard]==0.52.3
 joblib==1.5.3
+httpx==0.28.1
 
 # === Web Scraping (S&P 500 constituents) ===
 lxml
