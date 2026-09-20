@@ -66,6 +66,7 @@ def test_build_model_applies_config_overrides():
     assert params['max_depth'] == 3
     assert params['n_estimators'] == 50
 
+
 def test_build_logistic_model_default_config():
     """ An empty/None config should still produce a valid, seeded pipeline """
     # Act
@@ -103,7 +104,6 @@ def test_build_logistic_model_fits_and_predicts():
     assert len(y_pred) == len(y_test)
     assert all(p in (0, 1) for p in y_pred)
     assert all(0.0 <= p <= 1.0 for p in y_pred_proba)
-
 
 
 def test_train_model_and_evaluate_predictions():
@@ -145,6 +145,8 @@ def test_train_xgboost_event_model_smoke(tmp_path):
     # Assert
     assert 'accuracy' in metrics
     assert 'precision' in metrics
+    assert 0.0 <= metrics['train_accuracy'] <= 1.0
+    assert 0.0 <= metrics['train_precision'] <= 1.0
     X_test, y_test, y_pred, y_pred_proba = extras
     assert len(y_test) == 2
 
@@ -162,6 +164,126 @@ def test_train_xgboost_event_model_accepts_preloaded_df():
     # Assert
     assert 'accuracy' in metrics
 
+
+def test_split_by_universe():
+    """
+    path_a should keep only rows for tickers marked 'present' in
+    master_ticker_df; path_b should keep every row (current + delisted)
+    """
+    # Arrange: 'A' and 'B' are current, 'C' is delisted
+    features_df = make_fixture_df()  # Symbols A-F
+    master_ticker_df = pd.DataFrame({
+        'Symbol': ['A', 'B', 'C', 'D', 'E', 'F'],
+        'Date_added': ['2010-01-01'] * 6,
+        'Date_removed': ['present', 'present', '2019-01-01',
+                          '2019-01-01', 'present', '2019-01-01'],
+    })
+
+    # Act
+    path_a, path_b = ai.split_by_universe(features_df, master_ticker_df)
+
+    # Assert: path_a only has the 'present' tickers, path_b has everything
+    assert sorted(path_a['Symbol'].unique()) == ['A', 'B', 'E']
+    assert len(path_b) == len(features_df)
+
+
+def test_build_calibrated_model_default_config():
+    """ An empty/None config should still produce a valid CalibratedClassifierCV
+    with the documented defaults """
+    # Act
+    model = ai.build_calibrated_model()
+
+    # Assert
+    assert model.method == 'sigmoid'
+    assert model.cv == 3
+
+
+def test_build_calibrated_model_applies_config_overrides():
+    """ 'method'/'cv' should override the defaults, and 'base_config' should
+    pass through to the wrapped XGBClassifier """
+    # Act
+    model = ai.build_calibrated_model(
+        {'method': 'isotonic', 'cv': 2, 'base_config': {'max_depth': 3}})
+
+    # Assert
+    assert model.method == 'isotonic'
+    assert model.cv == 2
+    assert model.estimator.get_params()['max_depth'] == 3
+
+
+def test_build_calibrated_model_fits_and_predicts():
+    """ The wrapper should fit and produce valid predictions/probabilities,
+    exercising the same interface train_model() relies on """
+    # Arrange
+    df = make_fixture_df()
+    X_train, y_train, X_test, y_test = ai.split_train_test(
+        df, split_date="2023-01-01")
+    model = ai.build_calibrated_model({'cv': 2})
+
+    # Act
+    model, y_pred, y_pred_proba = ai.train_model(
+        model, X_train, y_train, X_test, y_test)
+
+    # Assert
+    assert len(y_pred) == len(y_test)
+    assert all(p in (0, 1) for p in y_pred)
+    assert all(0.0 <= p <= 1.0 for p in y_pred_proba)
+
+
+def test_compute_brier_score_perfect_predictions_is_zero():
+    """ Predicted probabilities that exactly match the outcomes should score 0.0 """
+    # Act
+    score = ai.compute_brier_score([1, 0, 1, 0], [1.0, 0.0, 1.0, 0.0])
+
+    # Assert
+    assert score == 0.0
+
+
+def test_compute_brier_score_worst_case_is_one():
+    """ Predicted probabilities that are exactly backwards should score 1.0,
+    the maximum possible for a binary outcome """
+    # Act
+    score = ai.compute_brier_score([1, 0], [0.0, 1.0])
+
+    # Assert
+    assert score == 1.0
+
+
+def test_compute_calibration_curve_bins_correctly():
+    """ Each bin's mean_predicted/fraction_positive should reflect exactly
+    the rows that fall in it """
+    # Arrange: two clearly-separated bins under n_bins=2 (split at 0.5)
+    y_true = [0, 0, 1, 1]
+    y_pred_proba = [0.1, 0.2, 0.6, 0.9]
+
+    # Act
+    result = ai.compute_calibration_curve(y_true, y_pred_proba, n_bins=2)
+
+    # Assert
+    assert len(result) == 2
+    low_bin = result.iloc[0]
+    assert low_bin['mean_predicted'] == pytest.approx(0.15)
+    assert low_bin['fraction_positive'] == 0.0
+    assert low_bin['count'] == 2
+    high_bin = result.iloc[1]
+    assert high_bin['mean_predicted'] == pytest.approx(0.75)
+    assert high_bin['fraction_positive'] == 1.0
+    assert high_bin['count'] == 2
+
+
+def test_compute_calibration_curve_drops_empty_bins():
+    """ Bins with no predictions in them should not appear as NaN rows """
+    # Arrange: n_bins=4 (edges 0/.25/.5/.75/1), only the first and last bin used
+    y_true = [0, 1]
+    y_pred_proba = [0.1, 0.9]
+
+    # Act
+    result = ai.compute_calibration_curve(y_true, y_pred_proba, n_bins=4)
+
+    # Assert: only 2 of the 4 bins have any predictions in them
+    assert len(result) == 2
+
+
 def test_carve_validation_slice():
     """ Rows before validation_date go to the fit set, on/after go to the validation set """
     # Arrange
@@ -178,7 +300,6 @@ def test_carve_validation_slice():
     assert len(X_fit) == 2   # 2022-01-01, 2022-02-01
     assert len(X_val) == 2   # 2022-03-01, 2022-04-01
     assert len(X_fit) + len(X_val) == len(X_train)
-
 
 
 def test_generate_walk_forward_folds_covers_full_range_without_overlap():
@@ -227,7 +348,6 @@ def test_generate_walk_forward_folds_returns_empty_list_when_no_data_after_start
     assert folds == []
 
 
-
 def test_train_model_with_eval_set_enables_early_stopping():
     """ Passing eval_set with early_stopping_rounds in the config should
     still produce valid, test-set-length predictions """
@@ -266,29 +386,6 @@ def test_train_xgboost_event_model_with_validation_date(tmp_path):
     # Assert
     assert 'accuracy' in metrics
     assert 0.0 <= metrics['train_precision'] <= 1.0
-    
-
-
-def test_split_by_universe():
-    """
-    path_a should keep only rows for tickers marked 'present' in
-    master_ticker_df; path_b should keep every row (current + delisted)
-    """
-    # Arrange: 'A' and 'B' are current, 'C' is delisted
-    features_df = make_fixture_df()  # Symbols A-F
-    master_ticker_df = pd.DataFrame({
-        'Symbol': ['A', 'B', 'C', 'D', 'E', 'F'],
-        'Date_added': ['2010-01-01'] * 6,
-        'Date_removed': ['present', 'present', '2019-01-01',
-                          '2019-01-01', 'present', '2019-01-01'],
-    })
-
-    # Act
-    path_a, path_b = ai.split_by_universe(features_df, master_ticker_df)
-
-    # Assert: path_a only has the 'present' tickers, path_b has everything
-    assert sorted(path_a['Symbol'].unique()) == ['A', 'B', 'E']
-    assert len(path_b) == len(features_df)
 
 
 def test_split_by_universe_path_a_is_subset_of_path_b():

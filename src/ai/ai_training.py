@@ -1,6 +1,8 @@
 import os
+import numpy as np
 import pandas as pd
 from xgboost import XGBClassifier
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -37,7 +39,11 @@ def build_model(config=None):
     Pure: config dict -> XGBClassifier. An empty/None config is the
     baseline - plain XGBoost defaults, no scale_pos_weight, no tuning -
     the reference point every later sweep step (TDD_REWRITE_PLAN.md §4)
-    is measured against.
+    is measured against. Regularisation (reg_alpha, reg_lambda,
+    scale_pos_weight) and tree-complexity controls (max_depth,
+    min_child_weight, subsample, colsample_bytree) all pass straight
+    through here with no extra wiring needed - only early stopping
+    (early_stopping_rounds) needs eval_set support in train_model below.
     """
     config = config or {}
     return XGBClassifier(random_state=42, n_jobs=-1, **config)
@@ -47,9 +53,14 @@ def build_logistic_model(config=None):
     """
     Pure: config dict -> a StandardScaler + LogisticRegression pipeline -
     a deliberately low-capacity baseline to compare against build_model's
-    XGBoost. Features are scaled first because logistic regression's
-    coefficients and convergence are sensitive to differing feature
-    scales - unlike XGBoost's tree splits, which are scale-invariant.
+    XGBoost (see report §5.6/Conclusion: "a simpler baseline model...
+    logistic regression"). Features are scaled first because logistic
+    regression's coefficients and convergence are sensitive to differing
+    feature scales (e.g. Surprise(%) spans tens of points, Return_60d
+    spans a fraction of 1) - unlike XGBoost's tree splits, which are
+    scale-invariant, so build_model has no equivalent step. Exposes the
+    same fit/predict/predict_proba interface, so it's a drop-in
+    replacement for build_model wherever train_model is called.
     """
     config = config or {}
     return Pipeline([
@@ -58,12 +69,46 @@ def build_logistic_model(config=None):
     ])
 
 
+def build_calibrated_model(config=None):
+    """
+    Pure: config dict -> a CalibratedClassifierCV wrapping build_model's
+    XGBClassifier. XGBoost's raw predict_proba is optimised for the
+    training objective (log-loss on the label), not for calibration -
+    there's no guarantee a predicted probability of 0.7 actually means
+    "70% of these fire" empirically, and filter_trade_signals() fires a
+    trade on nothing more than predict_proba > 0.5, so a systematically
+    over- or under-confident raw score silently selects the wrong set of
+    trades. CalibratedClassifierCV fits a secondary mapping from raw
+    scores to calibrated probabilities using internal cross-validation on
+    the training set, so the mapping isn't fit on the same data it's
+    evaluated on. config supports 'method' ('sigmoid' for Platt scaling,
+    the default, or 'isotonic' for a non-parametric monotonic fit), 'cv'
+    (number of internal folds, default 3), and 'base_config' (passed
+    straight through to build_model for the underlying XGBClassifier's
+    hyperparameters, default {}). Exposes the same fit/predict/
+    predict_proba interface as build_model, so it's a drop-in replacement
+    wherever train_model is called.
+    """
+    config = config or {}
+    base_model = build_model(config.get('base_config', {}))
+    return CalibratedClassifierCV(
+        estimator=base_model,
+        method=config.get('method', 'sigmoid'),
+        cv=config.get('cv', 3),
+    )
+
+
 def carve_validation_slice(X_train, y_train, dates, validation_date):
     """
     Pure: split a chronologically-ordered training set into (fit set,
     validation set) using validation_date as the boundary - rows before
     it are used to fit, rows from validation_date onward form the
-    held-out validation slice used for early stopping.
+    held-out validation slice used for early stopping. `dates` must be a
+    Series of datetimes aligned to X_train/y_train's index (e.g. the
+    source DataFrame's 'Date' column). Carving this slice out of the
+    training period, chronologically prior to the test period, is the
+    early-stopping intervention scoped in the Design chapter's
+    overfitting-reduction plan.
     """
     validation_date = pd.to_datetime(validation_date)
     fit_mask = dates.loc[X_train.index] < validation_date
@@ -102,13 +147,15 @@ def generate_walk_forward_folds(dates, first_test_start, fold_months=6):
     return folds
 
 
-
 def train_model(model, X_train, y_train, X_test, y_test, eval_set=None):
     """
     I/O (training): fit the model, return it plus predictions on the
-    held-out test set. If eval_set is given, training stops once
-    validation performance plateaus instead of always running the full
-    n_estimators rounds.
+    held-out test set. If eval_set is given (a validation slice, see
+    carve_validation_slice) and the model was built with
+    early_stopping_rounds in its config, training stops once validation
+    performance plateaus instead of always running the full
+    n_estimators rounds - the direct defence against fitting
+    training-set noise that the Design chapter scopes.
     """
     if eval_set is not None:
         model.fit(X_train, y_train, eval_set=eval_set, verbose=False)
@@ -121,7 +168,6 @@ def train_model(model, X_train, y_train, X_test, y_test, eval_set=None):
     return model, y_pred, y_pred_proba
 
 
-
 def evaluate_predictions(y_test, y_pred, y_pred_proba=None):
     """
     Pure: accuracy + precision on the held-out set. Precision on the
@@ -132,6 +178,51 @@ def evaluate_predictions(y_test, y_pred, y_pred_proba=None):
         'accuracy': accuracy_score(y_test, y_pred),
         'precision': precision_score(y_test, y_pred, zero_division=0),
     }
+
+
+def compute_brier_score(y_true, y_pred_proba):
+    """
+    Pure: mean squared error between predicted probabilities and actual
+    binary outcomes - the standard scalar summary of calibration quality
+    (0.0 = perfect, 0.25 = what a constant 0.5 prediction scores on a
+    balanced set). Complements precision/accuracy, which only look at the
+    thresholded 0/1 decision and say nothing about whether the underlying
+    confidence score itself is trustworthy.
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred_proba = np.asarray(y_pred_proba, dtype=float)
+    return float(np.mean((y_pred_proba - y_true) ** 2))
+
+
+def compute_calibration_curve(y_true, y_pred_proba, n_bins=10):
+    """
+    Pure: buckets predictions into n_bins equal-width probability bins
+    and computes, per bin, the mean predicted probability vs. the actual
+    observed fraction of positives - the reliability-diagram data used to
+    judge calibration. A perfectly calibrated model has mean_predicted ==
+    fraction_positive in every bin. Bins with zero predictions in them
+    are dropped rather than returned as NaN rows, since there's nothing
+    to plot or compare for an empty bin.
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred_proba = np.asarray(y_pred_proba, dtype=float)
+
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    bin_ids = np.digitize(y_pred_proba, bin_edges[1:-1])
+
+    rows = []
+    for b in range(n_bins):
+        mask = bin_ids == b
+        if not mask.any():
+            continue
+        rows.append({
+            'bin_low': bin_edges[b], 'bin_high': bin_edges[b + 1],
+            'mean_predicted': float(y_pred_proba[mask].mean()),
+            'fraction_positive': float(y_true[mask].mean()),
+            'count': int(mask.sum()),
+        })
+
+    return pd.DataFrame(rows)
 
 
 def split_by_universe(features_df, master_ticker_df):
@@ -167,9 +258,16 @@ def train_xgboost_event_model(
     load features -> split_train_test -> build_model ->
     train_model -> evaluate_predictions. Returns (model, metrics, extras)
     - extras carries the test set + predictions, and metrics/config are
-    what the caller passes to experiment_log.log_training_run().
+    what the caller passes to experiment_log.log_training_run(). metrics
+    also carries train_accuracy/train_precision (same model, scored on
+    X_train) alongside the test-set accuracy/precision - a large train-vs-
+    test gap is a classic overfitting signal.
     Pass a pre-loaded features_df (e.g. from split_by_universe()) to skip
-    reading features_file from disk.
+    reading features_file from disk. Pass validation_date to carve an
+    early-stopping validation slice out of the training period (requires
+    config to include early_stopping_rounds to have any effect) -
+    train_accuracy/train_precision are then scored on the narrowed
+    training set actually fitted, not the full pre-split_date period.
     """
     df = features_df if features_df is not None else pd.read_csv(
         features_file)
@@ -195,7 +293,6 @@ def train_xgboost_event_model(
     train_metrics = evaluate_predictions(y_train, train_pred, train_pred_proba)
     metrics['train_accuracy'] = train_metrics['accuracy']
     metrics['train_precision'] = train_metrics['precision']
-
 
     return model, metrics, (X_test, y_test, y_pred, y_pred_proba)
 
