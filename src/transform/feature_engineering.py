@@ -123,16 +123,69 @@ def compute_forward_returns(price_df, horizon=1):
     return result
 
 
-def label_spike_event(price_df, threshold=0.02, horizon=1):
+def label_spike_event(price_df, threshold=0.02, horizon=1, price_col='High'):
     """
-    Pure: binary label - 1 if the T+horizon High return exceeds
+    Pure: binary label - 1 if the T+horizon `price_col` return exceeds
     `threshold` (a "spike"), 0 otherwise. Crude fixed-threshold labeling;
-    triple-barrier labeling is a planned Phase 2+ replacement for this.
+    compute_triple_barrier_labels is a richer alternative that accounts
+    for downside risk, not just whether price ever touched the threshold.
+
+    price_col='High' (default) preserves the original production label -
+    whether price touched the threshold at any point intraday.
+    price_col='Close' instead labels on the T+horizon Close return, which
+    is what backtesting.py's DEFAULT_RETURN_COL actually trades on - use
+    this to align the training target with close-to-close execution
+    (see the target/execution alignment experiment; the High-based
+    default and Close-based backtest disagree on what "a spike" means).
     """
     result = price_df.copy()
-    high_col = f'Target_T{horizon}_High_Ret'
+    ret_col = f'Target_T{horizon}_{price_col}_Ret'
 
-    result['Target_Spike_Class'] = (result[high_col] > threshold).astype(int)
+    result['Target_Spike_Class'] = (result[ret_col] > threshold).astype(int)
+
+    return result
+
+
+def compute_triple_barrier_labels(price_df, take_profit=0.05, stop_loss=0.03, max_holding_days=5):
+    """
+    Pure: alternative to label_spike_event. For each row, scans forward up
+    to max_holding_days trading days (same Symbol) and labels by whichever
+    barrier is touched first: take_profit (a later day's High return
+    reaches it - label 1), stop_loss (a later day's Low return breaches it
+    - label 0), or neither, in which case the label falls back to the sign
+    of the return at the max_holding_days close (the "vertical" time
+    barrier). On a day both barriers are touched, stop_loss takes priority
+    - a conservative assumption, since daily OHLC alone can't say which was
+    actually hit first intraday. Writes the same 'Target_Spike_Class'
+    column as label_spike_event, so it's a drop-in swap for the rest of
+    the pipeline.
+    """
+    result = price_df.sort_values(by=['Symbol', 'Date']).reset_index(drop=True).copy()
+    entry_close = result['Close']
+
+    label = pd.Series(float('nan'), index=result.index)
+    touched = pd.Series(False, index=result.index)
+
+    for horizon in range(1, max_holding_days + 1):
+        fwd_high = result.groupby('Symbol')['High'].shift(-horizon)
+        fwd_low = result.groupby('Symbol')['Low'].shift(-horizon)
+
+        high_ret = (fwd_high - entry_close) / entry_close
+        low_ret = (fwd_low - entry_close) / entry_close
+
+        hits_stop_loss = (low_ret <= -stop_loss) & ~touched
+        hits_take_profit = (high_ret >= take_profit) & ~touched & ~hits_stop_loss
+
+        label[hits_stop_loss] = 0
+        label[hits_take_profit] = 1
+        touched |= hits_stop_loss | hits_take_profit
+
+    fwd_close_final = result.groupby('Symbol')['Close'].shift(-max_holding_days)
+    final_ret = (fwd_close_final - entry_close) / entry_close
+    hits_vertical = ~touched & fwd_close_final.notna()
+    label[hits_vertical] = (final_ret[hits_vertical] > 0).astype(float)
+
+    result['Target_Spike_Class'] = label
 
     return result
 
@@ -165,12 +218,21 @@ def generate_earnings_driven_features(
     sector_rank_window=60,
     forward_horizon=1,
     spike_threshold=0.02,
+    label_price_col='High',
+    use_triple_barrier=False,
+    take_profit=0.05,
+    stop_loss=0.03,
+    max_holding_days=5,
 ):
     """
     Orchestrator: wire load_price_panel -> merge_sector_map ->
     compute_momentum_features -> compute_sector_rank ->
-    compute_forward_returns -> label_spike_event -> merge_events, then
-    write the final event-driven feature table to output_file.
+    compute_forward_returns -> (label_spike_event or
+    compute_triple_barrier_labels) -> merge_events, then write the final
+    event-driven feature table to output_file. use_triple_barrier swaps
+    the labeling step; take_profit/stop_loss/max_holding_days only apply
+    when it's set. label_price_col only applies to label_spike_event -
+    see its docstring for the target/execution alignment rationale.
     """
     metadata_df = pd.read_csv(metadata_file)
     earnings_df = pd.read_csv(earnings_file)
@@ -180,7 +242,13 @@ def generate_earnings_driven_features(
     price_df = compute_momentum_features(price_df, momentum_windows)
     price_df = compute_sector_rank(price_df, sector_rank_window)
     price_df = compute_forward_returns(price_df, forward_horizon)
-    price_df = label_spike_event(price_df, spike_threshold, forward_horizon)
+
+    if use_triple_barrier:
+        price_df = compute_triple_barrier_labels(
+            price_df, take_profit, stop_loss, max_holding_days)
+    else:
+        price_df = label_spike_event(
+            price_df, spike_threshold, forward_horizon, label_price_col)
 
     event_df = merge_events(price_df, earnings_df)
     event_df = event_df.dropna(subset=[
@@ -201,6 +269,7 @@ def generate_earnings_driven_features(
     final_df.to_csv(output_file, index=False)
 
     return final_df
+
 
 
 if __name__ == "__main__":

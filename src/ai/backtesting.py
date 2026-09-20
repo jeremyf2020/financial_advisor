@@ -13,6 +13,59 @@ def filter_trade_signals(predictions_df, confidence_threshold=0.5, proba_col='y_
     return predictions_df[predictions_df[proba_col] > confidence_threshold].reset_index(drop=True)
 
 
+def compute_limit_order_returns(trades_df, threshold,
+                                 high_col='Target_T1_High_Ret',
+                                 close_col='Target_T1_Close_Ret'):
+    """
+    Pure: an alternative to always exiting at Close - simulates a limit
+    sell order placed at entry price * (1 + threshold), matching what a
+    High-based Target_Spike_Class label actually promised. If the day's
+    High return reaches threshold, the trade is assumed filled there
+    (capped at exactly threshold); otherwise, since the target was never
+    touched, the position is assumed closed at the day's actual Close
+    return instead. This is the alignment fix applied to execution
+    rather than to the label (compare against
+    feature_engineering.label_spike_event's price_col='Close' option,
+    which instead aligns the label to Close). Adds a 'Realized_Return'
+    column, usable as compute_daily_portfolio_returns'/
+    compute_backtest_kpis' return_col.
+    """
+    result = trades_df.copy()
+    hit = result[high_col] >= threshold
+    result['Realized_Return'] = result[close_col].where(~hit, threshold)
+    return result
+
+
+def compute_payoff_stats(trades_df, return_col=DEFAULT_RETURN_COL):
+    """
+    Pure: average winning-trade return, average losing-trade return, and
+    the payoff ratio (avg_win / abs(avg_loss)) - the piece win_rate alone
+    can't show. A low win rate can still be profitable if avg_win is
+    large enough relative to avg_loss (and vice versa); §5.4's debunked
+    triple-barrier result showed this ratio, not win rate, was what
+    actually drove that config's return. payoff_ratio is None if there
+    are no losing trades (division undefined, not "infinitely good").
+    """
+    wins = trades_df[trades_df[return_col] > 0][return_col]
+    losses = trades_df[trades_df[return_col] <= 0][return_col]
+
+    avg_win = float(wins.mean()) if len(wins) > 0 else 0.0
+    avg_loss = float(losses.mean()) if len(losses) > 0 else 0.0
+    payoff_ratio = abs(avg_win / avg_loss) if avg_loss != 0 else None
+
+    return {'avg_win': avg_win, 'avg_loss': avg_loss, 'payoff_ratio': payoff_ratio}
+
+
+def exclude_top_n_trades(trades_df, n, return_col=DEFAULT_RETURN_COL):
+    """
+    Pure: removes the n trades with the highest return_col values - a
+    robustness check for whether a backtest's total return depends on a
+    handful of extreme winners rather than a broad, repeatable edge
+    (generalising the controlled comparison §5.4 used to debunk the
+    triple-barrier result to any configuration, not just that one).
+    """
+    return trades_df.sort_values(return_col, ascending=False).iloc[n:].reset_index(drop=True)
+
 def compute_daily_portfolio_returns(trades_df, transaction_cost=0.001,
                                      return_col=DEFAULT_RETURN_COL, max_position_weight=None):
     """

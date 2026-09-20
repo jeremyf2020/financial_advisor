@@ -25,6 +25,66 @@ def test_filter_trade_signals():
     # Assert: 'C' (0.3) is filtered out, the rest (>= 0.6) remain
     assert sorted(trades_df['Symbol']) == ['A', 'B', 'D', 'E']
 
+def test_compute_limit_order_returns_fills_at_threshold_when_high_touches_it():
+    """ If High return reaches the threshold, Realized_Return is capped at
+    exactly threshold - not the (possibly much larger) actual High return """
+    trades_df = pd.DataFrame({
+        'Target_T1_High_Ret': [0.09],   # touches and overshoots the 7% target
+        'Target_T1_Close_Ret': [0.02],  # closed up only 2% by end of day
+    })
+
+    result = bt.compute_limit_order_returns(trades_df, threshold=0.07)
+
+    assert result.iloc[0]['Realized_Return'] == pytest.approx(0.07)
+
+
+def test_compute_limit_order_returns_falls_back_to_close_when_not_touched():
+    """ If High never reaches the threshold, Realized_Return falls back to
+    the actual Close return - the order was never filled """
+    trades_df = pd.DataFrame({
+        'Target_T1_High_Ret': [0.04],    # never reaches the 7% target
+        'Target_T1_Close_Ret': [-0.01],  # closed down 1%
+    })
+
+    result = bt.compute_limit_order_returns(trades_df, threshold=0.07)
+
+    assert result.iloc[0]['Realized_Return'] == pytest.approx(-0.01)
+
+
+def test_compute_payoff_stats():
+    """ avg_win/avg_loss/payoff_ratio should reflect the win/loss split of the raw returns """
+    trades_df = pd.DataFrame({
+        'Target_T1_Close_Ret': [0.10, 0.20, -0.05, -0.05],  # 2 wins avg 0.15, 2 losses avg -0.05
+    })
+
+    stats = bt.compute_payoff_stats(trades_df)
+
+    assert stats['avg_win'] == pytest.approx(0.15)
+    assert stats['avg_loss'] == pytest.approx(-0.05)
+    assert stats['payoff_ratio'] == pytest.approx(3.0)
+
+
+def test_compute_payoff_stats_no_losses_gives_none_ratio():
+    """ payoff_ratio should be None (undefined), not raise, when there are no losing trades """
+    trades_df = pd.DataFrame({'Target_T1_Close_Ret': [0.10, 0.05]})
+
+    stats = bt.compute_payoff_stats(trades_df)
+
+    assert stats['payoff_ratio'] is None
+
+
+def test_exclude_top_n_trades():
+    """ Should drop exactly the n highest-return rows, keeping the rest """
+    trades_df = pd.DataFrame({
+        'Target_T1_Close_Ret': [0.50, 0.01, -0.02, 0.30, -0.10],
+    })
+
+    result = bt.exclude_top_n_trades(trades_df, n=2)
+
+    # the 0.50 and 0.30 rows (the two highest) should be gone
+    assert sorted(result['Target_T1_Close_Ret'].tolist()) == [-0.10, -0.02, 0.01]
+
+
 
 def test_compute_daily_portfolio_returns_averages_same_day_trades():
     """ Trades on the same Date should average into one equal-weighted return, net of cost """

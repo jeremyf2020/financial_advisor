@@ -190,6 +190,94 @@ def test_label_spike_event():
     assert result['Target_Spike_Class'].tolist() == [1, 0, 1]
 
 
+def test_label_spike_event_close_based():
+    """ price_col='Close' should label on the T+1 Close return instead of High -
+    aligning the label with backtesting.py's actual close-to-close execution """
+    # Arrange
+    price_df = pd.DataFrame({
+        'Target_T1_High_Ret': [0.03, 0.03, 0.03],   # would all be spikes if using High
+        'Target_T1_Close_Ret': [0.03, 0.01, -0.01],  # only the first clears threshold on Close
+    })
+
+    # Act
+    result = fe.label_spike_event(price_df, threshold=0.02, price_col='Close')
+
+    # Assert
+    assert result['Target_Spike_Class'].tolist() == [1, 0, 0]
+
+
+def test_compute_triple_barrier_labels_take_profit_hit():
+    """ A later day's High crossing take_profit (without Low crossing stop_loss first) labels 1 """
+    price_df = pd.DataFrame({
+        'Date': ['2024-01-01', '2024-01-02'],
+        'Symbol': ['TP', 'TP'],
+        'High': [101.0, 106.0], 'Low': [99.0, 99.0], 'Close': [100.0, 105.0],
+    })
+
+    result = fe.compute_triple_barrier_labels(
+        price_df, take_profit=0.05, stop_loss=0.03, max_holding_days=1)
+
+    assert result.iloc[0]['Target_Spike_Class'] == 1
+
+
+def test_compute_triple_barrier_labels_stop_loss_hit():
+    """ A later day's Low crossing stop_loss labels 0 """
+    price_df = pd.DataFrame({
+        'Date': ['2024-01-01', '2024-01-02'],
+        'Symbol': ['SL', 'SL'],
+        'High': [100.0, 101.0], 'Low': [100.0, 96.0], 'Close': [100.0, 97.0],
+    })
+
+    result = fe.compute_triple_barrier_labels(
+        price_df, take_profit=0.05, stop_loss=0.03, max_holding_days=1)
+
+    assert result.iloc[0]['Target_Spike_Class'] == 0
+
+
+def test_compute_triple_barrier_labels_both_touched_same_day_stop_loss_wins():
+    """ If a single day's range crosses both barriers, stop_loss takes priority (conservative) """
+    price_df = pd.DataFrame({
+        'Date': ['2024-01-01', '2024-01-02'],
+        'Symbol': ['BOTH', 'BOTH'],
+        'High': [100.0, 110.0], 'Low': [100.0, 90.0], 'Close': [100.0, 95.0],
+    })
+
+    result = fe.compute_triple_barrier_labels(
+        price_df, take_profit=0.05, stop_loss=0.03, max_holding_days=1)
+
+    assert result.iloc[0]['Target_Spike_Class'] == 0
+
+
+def test_compute_triple_barrier_labels_vertical_barrier_fallback():
+    """ Neither barrier touched within max_holding_days -> label by the sign of the final close return """
+    price_df = pd.DataFrame({
+        'Date': ['2024-01-01', '2024-01-02', '2024-01-03'],
+        'Symbol': ['VERT', 'VERT', 'VERT'],
+        'High': [100.0, 102.0, 103.0], 'Low': [100.0, 99.0, 98.0],
+        'Close': [100.0, 101.0, 104.0],
+    })
+
+    result = fe.compute_triple_barrier_labels(
+        price_df, take_profit=0.05, stop_loss=0.03, max_holding_days=2)
+
+    # neither barrier crossed on day 1 or day 2; final close (104) vs entry (100) is +4% -> label 1
+    assert result.iloc[0]['Target_Spike_Class'] == 1
+
+
+def test_compute_triple_barrier_labels_insufficient_future_data_is_nan():
+    """ A row too close to the end of its Symbol's history to evaluate any barrier should be NaN """
+    price_df = pd.DataFrame({
+        'Date': ['2024-01-01'],
+        'Symbol': ['THIN'],
+        'High': [100.0], 'Low': [100.0], 'Close': [100.0],
+    })
+
+    result = fe.compute_triple_barrier_labels(
+        price_df, take_profit=0.05, stop_loss=0.03, max_holding_days=2)
+
+    assert pd.isna(result.iloc[0]['Target_Spike_Class'])
+
+
 def test_merge_events_keeps_only_announcement_days():
     """ merge_events should drop every row without a matching earnings row that day """
     # Arrange
