@@ -25,6 +25,7 @@ def test_filter_trade_signals():
     # Assert: 'C' (0.3) is filtered out, the rest (>= 0.6) remain
     assert sorted(trades_df['Symbol']) == ['A', 'B', 'D', 'E']
 
+
 def test_compute_limit_order_returns_fills_at_threshold_when_high_touches_it():
     """ If High return reaches the threshold, Realized_Return is capped at
     exactly threshold - not the (possibly much larger) actual High return """
@@ -84,6 +85,89 @@ def test_exclude_top_n_trades():
     # the 0.50 and 0.30 rows (the two highest) should be gone
     assert sorted(result['Target_T1_Close_Ret'].tolist()) == [-0.10, -0.02, 0.01]
 
+
+def test_compute_tranche_portfolio_returns_drops_trades_when_no_tranche_free():
+    """ A third same-day trade should be dropped once both tranches are occupied """
+    # Arrange
+    trades_df = pd.DataFrame({
+        'Date': ['2024-01-01', '2024-01-01', '2024-01-01'],
+        'Symbol': ['A', 'B', 'C'],
+        'Target_T1_Close_Ret': [0.05, 0.03, 0.10],
+    })
+
+    # Act
+    daily_df, accepted_df = bt.compute_tranche_portfolio_returns(
+        trades_df, horizon=5, n_tranches=2)
+
+    # Assert: only the first 2 (A, B) get a free tranche; C is dropped
+    assert len(accepted_df) == 2
+    assert set(accepted_df['Symbol']) == {'A', 'B'}
+
+
+def test_compute_tranche_portfolio_returns_frees_tranche_after_horizon_business_days():
+    """ A tranche should become available again exactly `horizon` business
+    days after the trade that occupied it """
+    # Arrange: A and B occupy both tranches on 2024-01-01 (a Monday); C
+    # arrives on 2024-01-08 - exactly 5 business days later
+    trades_df = pd.DataFrame({
+        'Date': ['2024-01-01', '2024-01-01', '2024-01-08'],
+        'Symbol': ['A', 'B', 'C'],
+        'Target_T1_Close_Ret': [0.05, 0.03, 0.02],
+    })
+
+    # Act
+    daily_df, accepted_df = bt.compute_tranche_portfolio_returns(
+        trades_df, horizon=5, n_tranches=2)
+
+    # Assert: all 3 accepted - a tranche freed up exactly in time for C
+    assert len(accepted_df) == 3
+
+
+def test_compute_tranche_portfolio_returns_weights_by_n_tranches():
+    """ Each accepted trade's contribution should be scaled by 1/n_tranches """
+    # Arrange
+    trades_df = pd.DataFrame({
+        'Date': ['2024-01-01'],
+        'Symbol': ['A'],
+        'Target_T1_Close_Ret': [0.10],
+    })
+
+    # Act
+    daily_df, accepted_df = bt.compute_tranche_portfolio_returns(
+        trades_df, horizon=5, n_tranches=4, transaction_cost=0.0)
+
+    # Assert: 0.10 * (1/4)
+    assert daily_df.iloc[0]['Daily_Return'] == pytest.approx(0.025)
+
+
+def test_compute_tranche_portfolio_returns_defaults_n_tranches_to_horizon():
+    """ n_tranches should default to horizon when not given """
+    # Arrange: 3 same-day trades, horizon=2 (so only 2 tranches by default)
+    trades_df = pd.DataFrame({
+        'Date': ['2024-01-01'] * 3,
+        'Symbol': ['A', 'B', 'C'],
+        'Target_T1_Close_Ret': [0.1, 0.1, 0.1],
+    })
+
+    # Act
+    daily_df, accepted_df = bt.compute_tranche_portfolio_returns(trades_df, horizon=2)
+
+    # Assert
+    assert len(accepted_df) == 2
+
+
+def test_compute_tranche_portfolio_returns_empty_trades_returns_empty():
+    """ An empty trades_df should return empty results, not raise """
+    # Arrange
+    trades_df = pd.DataFrame(columns=['Date', 'Symbol', 'Target_T1_Close_Ret'])
+
+    # Act
+    daily_df, accepted_df = bt.compute_tranche_portfolio_returns(
+        trades_df, horizon=5, n_tranches=4)
+
+    # Assert
+    assert daily_df.empty
+    assert accepted_df.empty
 
 
 def test_compute_daily_portfolio_returns_averages_same_day_trades():
@@ -204,6 +288,31 @@ def test_run_event_driven_backtest_smoke(tmp_path):
     # Act
     metrics = bt.run_event_driven_backtest(
         predictions_df, run_id, log_file=str(log_file))
+
+    # Assert
+    assert set(metrics.keys()) == {
+        'total_return', 'win_rate', 'max_drawdown', 'sharpe'}
+    logged = experiment_log.load_experiment_log(log_file=str(log_file))
+    row = logged[logged['run_id'] == run_id].iloc[0]
+    assert row['total_return'] == pytest.approx(metrics['total_return'])
+
+
+def test_run_tranche_backtest_smoke(tmp_path):
+    """
+    Orchestrator smoke test: wires filter -> tranche returns -> equity
+    curve -> kpis, then upserts the result onto an existing training run's
+    row - the capital-constrained counterpart to run_event_driven_backtest
+    """
+    # Arrange
+    log_file = tmp_path / "experiment_log.csv"
+    run_id = experiment_log.new_run_id()
+    experiment_log.log_training_run(
+        run_id, {}, {'accuracy': 0.6, 'precision': 0.5}, log_file=str(log_file))
+    predictions_df = make_predictions_df()
+
+    # Act
+    metrics = bt.run_tranche_backtest(
+        predictions_df, run_id, horizon=5, log_file=str(log_file))
 
     # Assert
     assert set(metrics.keys()) == {

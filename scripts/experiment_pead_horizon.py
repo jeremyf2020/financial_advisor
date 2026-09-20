@@ -12,18 +12,26 @@ partial step toward the full ~60-day drift window) - instead of T+1?
 
 Two configs, same 7% threshold, same universe, same model hyperparameters -
 only the horizon and label/execution alignment change. No src changes were
-needed for this - generate_earnings_driven_features/label_spike_event/
-compute_forward_returns already take an arbitrary forward_horizon, and
-backtesting's functions already take a return_col override, so a T+20
-config is just a different set of arguments to already-tested code.
+needed for generating the T+20 data - generate_earnings_driven_features/
+label_spike_event/compute_forward_returns already take an arbitrary
+forward_horizon, so a T+20 config is just a different set of arguments to
+already-tested code.
 
   A. T+1 (current production) - High-based label, Close-based execution
      (the existing mismatch, unchanged here - this config is the
-     reference point, not the subject of this experiment).
+     reference point, not the subject of this experiment). Backtested with
+     run_event_driven_backtest (day-by-day compounding, correct for a
+     horizon=1 position that resolves the next trading day).
   D. T+20 aligned - label AND execution both use the T+20 Close return,
      the closest approximation to the literature's drift window this
      project's data supports without adding a dedicated longer-horizon
-     feature set.
+     feature set. Backtested with run_tranche_backtest instead: a T+20
+     position stays open for 20 trading days, so day-by-day compounding
+     would implicitly assume unlimited overlapping leverage. Capital is
+     split into 20 tranches, each holding at most one open position at a
+     time; a signal that fires while every tranche is occupied is dropped,
+     not force-fitted - n_accepted (vs. n_trades) shows how many signals
+     that capital constraint actually cost.
 
 For each: Tier 1 (precision/gap), Tier 2 (backtest), and the same
 payoff/outlier-robustness check used throughout this notebook - a config
@@ -96,12 +104,17 @@ def run_config(label, forward_horizon, universe_df):
         experiment_log.log_backtest_result(run_id, backtest_metrics)
         payoff = {'avg_win': float('nan'), 'avg_loss': float('nan'), 'payoff_ratio': None}
         robustness = {f'return_excl_top{n}': float('nan') for n in OUTLIER_CHECK_NS}
-    else:
+        n_accepted = 0
+    elif forward_horizon == 1:
+        # horizon=1: a position resolves the next trading day, so the
+        # existing daily-compounding backtest (with a per-trade weight cap)
+        # is already correct - no capital-overlap issue to correct for.
         backtest_metrics = backtesting.run_event_driven_backtest(
             predictions_df, run_id, return_col=return_col,
             max_position_weight=MAX_POSITION_WEIGHT, log_file=experiment_log.DEFAULT_LOG_FILE)
         trades_df = backtesting.filter_trade_signals(predictions_df)
         payoff = backtesting.compute_payoff_stats(trades_df, return_col=return_col)
+        n_accepted = len(trades_df)
 
         robustness = {}
         for n in OUTLIER_CHECK_NS:
@@ -114,11 +127,40 @@ def run_config(label, forward_horizon, universe_df):
             equity_df = backtesting.build_equity_curve(daily_df)
             kpis = backtesting.compute_backtest_kpis(equity_df, trimmed_df, return_col=return_col)
             robustness[f'return_excl_top{n}'] = kpis['total_return']
+    else:
+        # horizon > 1: a position stays open for `forward_horizon` trading
+        # days, so use the capital-constrained tranche backtest instead of
+        # daily compounding (which would assume unlimited overlapping
+        # leverage - see the notebook write-up for this experiment).
+        backtest_metrics = backtesting.run_tranche_backtest(
+            predictions_df, run_id, horizon=forward_horizon, return_col=return_col,
+            log_file=experiment_log.DEFAULT_LOG_FILE)
+        trades_df = backtesting.filter_trade_signals(predictions_df)
+        _, accepted_df = backtesting.compute_tranche_portfolio_returns(
+            trades_df, horizon=forward_horizon, return_col=return_col)
+        payoff = backtesting.compute_payoff_stats(accepted_df, return_col=return_col)
+        n_accepted = len(accepted_df)
+
+        robustness = {}
+        for n in OUTLIER_CHECK_NS:
+            trimmed_df = backtesting.exclude_top_n_trades(trades_df, n, return_col=return_col)
+            if trimmed_df.empty:
+                robustness[f'return_excl_top{n}'] = float('nan')
+                continue
+            trimmed_daily_df, trimmed_accepted_df = backtesting.compute_tranche_portfolio_returns(
+                trimmed_df, horizon=forward_horizon, return_col=return_col)
+            if trimmed_accepted_df.empty:
+                robustness[f'return_excl_top{n}'] = float('nan')
+                continue
+            equity_df = backtesting.build_equity_curve(trimmed_daily_df)
+            kpis = backtesting.compute_backtest_kpis(equity_df, trimmed_accepted_df, return_col=return_col)
+            robustness[f'return_excl_top{n}'] = kpis['total_return']
 
     gap = metrics['train_precision'] - metrics['precision']
     return {'config': label, 'test_precision': metrics['precision'],
             'train_precision': metrics['train_precision'], 'gap': gap,
-            'n_trades': n_trades, **backtest_metrics, **payoff, **robustness}
+            'n_trades': n_trades, 'n_accepted': n_accepted,
+            **backtest_metrics, **payoff, **robustness}
 
 
 def main():
@@ -138,12 +180,12 @@ def main():
 
     print("--- Summary: precision / gap / return / risk ---")
     header = (f"{'config':52s}  {'precision':>9s}  {'gap':>7s}  {'n_trades':>8s}  "
-              f"{'return':>9s}  {'win_rate':>9s}  {'max_dd':>9s}  {'sharpe':>7s}")
+              f"{'n_accepted':>10s}  {'return':>9s}  {'win_rate':>9s}  {'max_dd':>9s}  {'sharpe':>7s}")
     print(header)
     for r in results:
         print(f"{r['config']:52s}  {fmt(r['test_precision'])}  {fmt(r['gap'])[:7]:>7s}  "
-              f"{r['n_trades']:8d}  {r['total_return']:9.4%}  {r['win_rate']:9.4%}  "
-              f"{r['max_drawdown']:9.4%}  {r['sharpe']:7.4f}")
+              f"{r['n_trades']:8d}  {r['n_accepted']:10d}  {r['total_return']:9.4%}  "
+              f"{r['win_rate']:9.4%}  {r['max_drawdown']:9.4%}  {r['sharpe']:7.4f}")
 
     print("\n--- Summary: payoff structure + outlier robustness ---")
     header2 = (f"{'config':52s}  {'avg_win':>9s}  {'avg_loss':>9s}  {'payoff':>7s}  " +

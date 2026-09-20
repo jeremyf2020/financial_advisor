@@ -66,6 +66,66 @@ def exclude_top_n_trades(trades_df, n, return_col=DEFAULT_RETURN_COL):
     """
     return trades_df.sort_values(return_col, ascending=False).iloc[n:].reset_index(drop=True)
 
+
+def compute_tranche_portfolio_returns(trades_df, horizon, n_tranches=None,
+                                       transaction_cost=0.001, return_col=DEFAULT_RETURN_COL):
+    """
+    Pure: the correct alternative to compute_daily_portfolio_returns for
+    any horizon > 1. compute_daily_portfolio_returns implicitly assumes a
+    trade's capital is free again the very next trading day - true for a
+    T+1 strategy, but wrong for a longer holding period, where the same
+    capital would otherwise be double-counted as open in multiple
+    overlapping positions at once (an implicit, unlimited-leverage
+    assumption). Here, capital is split into n_tranches (defaulting to
+    horizon) equal slices, each able to hold one open position at a time;
+    trades are processed in chronological Date order and assigned to
+    whichever tranche is free (its previous position, if any, has already
+    resolved `horizon` business days after it opened) - if every tranche
+    is occupied, the trade is dropped (no capital available), not
+    force-fitted, matching what a capital-constrained strategy would
+    actually do. horizon is treated as business days, an approximation of
+    the trading-day horizon compute_forward_returns actually used - this
+    function only sees the event/signal days already filtered into
+    trades_df, not a full trading calendar to count exact trading days
+    against. Returns (daily_returns_df, accepted_trades_df) - the second
+    df (the trades tranche capital actually allowed to be taken) is what
+    compute_backtest_kpis' win_rate should be computed against, not every
+    signal filter_trade_signals produced.
+    """
+    n_tranches = n_tranches or horizon
+    sorted_df = trades_df.sort_values('Date').reset_index(drop=True).copy()
+
+    if sorted_df.empty:
+        return (pd.DataFrame(columns=['Date', 'Daily_Return']),
+                sorted_df.iloc[0:0])
+
+    dates = pd.to_datetime(sorted_df['Date'])
+    free_at = [pd.Timestamp.min] * n_tranches
+    accepted_mask = []
+
+    for date in dates:
+        free_idx = next((i for i, t in enumerate(free_at) if t <= date), None)
+        if free_idx is None:
+            accepted_mask.append(False)
+            continue
+        free_at[free_idx] = date + pd.tseries.offsets.BDay(horizon)
+        accepted_mask.append(True)
+
+    accepted_df = sorted_df[accepted_mask].reset_index(drop=True)
+
+    if accepted_df.empty:
+        return pd.DataFrame(columns=['Date', 'Daily_Return']), accepted_df
+
+    weight = 1 / n_tranches
+    net_return = accepted_df[return_col] - transaction_cost
+    accepted_df = accepted_df.assign(Weighted_Return=net_return * weight)
+
+    daily = accepted_df.groupby('Date')['Weighted_Return'].sum().reset_index()
+    daily = daily.rename(columns={'Weighted_Return': 'Daily_Return'})
+
+    return daily.sort_values('Date').reset_index(drop=True), accepted_df
+
+
 def compute_daily_portfolio_returns(trades_df, transaction_cost=0.001,
                                      return_col=DEFAULT_RETURN_COL, max_position_weight=None):
     """
@@ -155,6 +215,40 @@ def run_event_driven_backtest(
         trades_df, transaction_cost, return_col, max_position_weight)
     equity_curve_df = build_equity_curve(daily_returns_df, initial_capital)
     metrics = compute_backtest_kpis(equity_curve_df, trades_df, return_col)
+
+    experiment_log.log_backtest_result(run_id, metrics, log_file)
+
+    return metrics
+
+
+def run_tranche_backtest(
+    predictions_df,
+    run_id,
+    horizon,
+    confidence_threshold=0.5,
+    transaction_cost=0.001,
+    initial_capital=100000,
+    return_col=DEFAULT_RETURN_COL,
+    n_tranches=None,
+    log_file=experiment_log.DEFAULT_LOG_FILE,
+):
+    """
+    Orchestrator: filter_trade_signals -> compute_tranche_portfolio_returns
+    -> build_equity_curve -> compute_backtest_kpis, then upserts the result
+    onto run_id's row via experiment_log.log_backtest_result(). The
+    capital-constrained counterpart to run_event_driven_backtest - use this
+    instead whenever horizon > 1, since run_event_driven_backtest's
+    day-by-day compounding assumes a position resolves the very next
+    trading day, which only holds for horizon=1. compute_backtest_kpis'
+    win_rate is scored against the trades tranche capital actually
+    accepted, not every signal filter_trade_signals produced - a trade
+    dropped for lack of free capital was never actually taken.
+    """
+    trades_df = filter_trade_signals(predictions_df, confidence_threshold)
+    daily_returns_df, accepted_df = compute_tranche_portfolio_returns(
+        trades_df, horizon, n_tranches, transaction_cost, return_col)
+    equity_curve_df = build_equity_curve(daily_returns_df, initial_capital)
+    metrics = compute_backtest_kpis(equity_curve_df, accepted_df, return_col)
 
     experiment_log.log_backtest_result(run_id, metrics, log_file)
 
