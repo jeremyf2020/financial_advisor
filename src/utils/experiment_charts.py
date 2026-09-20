@@ -77,6 +77,78 @@ def diff_config_between_runs(log_df):
     return pd.DataFrame(rows)
 
 
+def compute_train_test_gap(log_df, metric='precision'):
+    """
+    Pure: train-minus-test gap for `metric`, per run - the same fitted
+    model scored on its own training data vs. held-out test data. A large
+    positive gap (much better on data it was trained on) is a classic
+    overfitting signal. Runs logged before train_accuracy/train_precision
+    existed show NaN here, not zero - there's no way to compute their gap
+    retroactively.
+    """
+    labeled = label_runs_sequentially(log_df)
+    train_col = f'train_{metric}'
+
+    gap_df = labeled[['Run_Label', train_col, metric]].copy()
+    gap_df['gap'] = gap_df[train_col] - gap_df[metric]
+
+    return gap_df
+
+
+def compute_gap_vs_backtest(log_df, metric='precision'):
+    """
+    Pure: joins each run's train/test gap (see compute_train_test_gap) with
+    its Tier 2 backtest results into one table, so a single query can check
+    whether any run across the whole logged history has achieved both a low
+    gap and strong financial performance at once - or whether closing the
+    gap and improving Tier 2 have been in tension across every
+    configuration actually tried so far. Runs missing either side (no
+    train_precision recorded, or Tier 2 never computed for that run) are
+    dropped, since there's nothing to compare for them.
+    """
+    labeled = label_runs_sequentially(log_df)
+    train_col = f'train_{metric}'
+
+    result = labeled[['Run_Label', train_col, metric, 'total_return',
+                       'win_rate', 'max_drawdown', 'sharpe']].copy()
+    result['gap'] = result[train_col] - result[metric]
+
+    return result.dropna(subset=['gap', 'total_return']).reset_index(drop=True)
+
+
+def plot_scatter(x_metric, y_metric, df, label_col='Run_Label'):
+    """
+    Scatter of x_metric vs y_metric from an already-prepared DataFrame
+    (e.g. compute_gap_vs_backtest's output), each point labeled from
+    label_col. Unlike plot_tradeoff, this does not re-derive Run_Label
+    from a raw experiment log - the input here is already a derived/joined
+    table, not the log itself, so it has no timestamp column to sort by.
+    """
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.scatter(df[x_metric], df[y_metric])
+    for _, row in df.iterrows():
+        ax.annotate(row[label_col], (row[x_metric], row[y_metric]), fontsize=8)
+    ax.set_xlabel(x_metric)
+    ax.set_ylabel(y_metric)
+    fig.tight_layout()
+
+    return fig
+
+
+def summarize_run_counts(log_df):
+    """
+    Pure: how many runs are logged in total, and how many of those have
+    an actual backtest (Tier 2) result. The more times Tier 2 gets
+    consulted while iterating toward a "winning" config, the less that
+    win can be trusted - this is the raw count behind that caveat, not a
+    judgment call on whether it's been consulted too many times.
+    """
+    total_runs = len(log_df)
+    backtested_runs = int(log_df['total_return'].notna().sum())
+
+    return {'total_runs': total_runs, 'backtested_runs': backtested_runs}
+
+
 def plot_metric_trend(metric, log_df=None, log_file=experiment_log.DEFAULT_LOG_FILE):
     """
     Line chart of `metric` across every logged run, in chronological order -
