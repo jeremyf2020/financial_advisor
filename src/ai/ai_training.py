@@ -71,6 +71,38 @@ def carve_validation_slice(X_train, y_train, dates, validation_date):
             X_train[~fit_mask], y_train[~fit_mask])
 
 
+def generate_walk_forward_folds(dates, first_test_start, fold_months=6):
+    """
+    Pure: split a chronologically-ordered date range into a sequence of
+    expanding-window walk-forward folds. Fold i trains on every date
+    strictly before that fold's test_start (all history that would
+    actually be available to a periodically-retrained production model at
+    that point in time) and tests on the following fold_months-month
+    window, then rolls forward. A single chronological split (as used
+    everywhere else in this project) can only show performance at one
+    point in time; walking forward through several folds instead shows
+    whether that performance is stable across different market periods,
+    or an artefact of exactly where that one split happened to land.
+    Returns a list of (test_start, test_end) Timestamp pairs, stopping
+    once test_start passes the last available date - a trailing fold
+    shorter than fold_months is included as long as it still covers at
+    least one date, so the tail of the data isn't silently dropped.
+    """
+    dates = pd.to_datetime(dates)
+    max_date = dates.max()
+    test_start = pd.to_datetime(first_test_start)
+
+    folds = []
+    while test_start <= max_date:
+        test_end = test_start + pd.DateOffset(months=fold_months)
+        if ((dates >= test_start) & (dates < test_end)).any():
+            folds.append((test_start, test_end))
+        test_start = test_end
+
+    return folds
+
+
+
 def train_model(model, X_train, y_train, X_test, y_test, eval_set=None):
     """
     I/O (training): fit the model, return it plus predictions on the

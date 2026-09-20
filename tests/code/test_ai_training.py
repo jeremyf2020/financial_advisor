@@ -180,6 +180,54 @@ def test_carve_validation_slice():
     assert len(X_fit) + len(X_val) == len(X_train)
 
 
+
+def test_generate_walk_forward_folds_covers_full_range_without_overlap():
+    """ Folds should be contiguous (each fold's end is the next fold's start)
+    and stop once the dates run out """
+    # Arrange: dates span 2022-06-01 to 2023-10-15
+    dates = pd.to_datetime(['2022-06-01', '2022-09-01', '2023-01-15',
+                             '2023-06-01', '2023-10-15'])
+
+    # Act
+    folds = ai.generate_walk_forward_folds(
+        dates, first_test_start="2023-01-01", fold_months=6)
+
+    # Assert: fold 1 is Jan-Jul 2023, fold 2 is Jul 2023-Jan 2024 (covers 10-15)
+    assert folds[0] == (pd.Timestamp("2023-01-01"), pd.Timestamp("2023-07-01"))
+    assert folds[1] == (pd.Timestamp("2023-07-01"), pd.Timestamp("2024-01-01"))
+    for i in range(len(folds) - 1):
+        assert folds[i][1] == folds[i + 1][0]
+
+
+def test_generate_walk_forward_folds_skips_empty_trailing_fold():
+    """ A fold window with no dates in it at all (e.g. past the last
+    available date) should not be included """
+    # Arrange: last date is well inside the first fold's window
+    dates = pd.to_datetime(['2022-06-01', '2023-02-01'])
+
+    # Act
+    folds = ai.generate_walk_forward_folds(
+        dates, first_test_start="2023-01-01", fold_months=6)
+
+    # Assert: exactly one fold (2023-01-01 to 2023-07-01), no empty tail fold
+    assert len(folds) == 1
+
+
+def test_generate_walk_forward_folds_returns_empty_list_when_no_data_after_start():
+    """ If every date is before first_test_start, there is nothing to
+    walk forward through """
+    # Arrange
+    dates = pd.to_datetime(['2020-01-01', '2020-06-01'])
+
+    # Act
+    folds = ai.generate_walk_forward_folds(
+        dates, first_test_start="2023-01-01", fold_months=6)
+
+    # Assert
+    assert folds == []
+
+
+
 def test_train_model_with_eval_set_enables_early_stopping():
     """ Passing eval_set with early_stopping_rounds in the config should
     still produce valid, test-set-length predictions """
