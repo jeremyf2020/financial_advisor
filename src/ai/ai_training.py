@@ -1,14 +1,12 @@
 import os
 import pandas as pd
 from xgboost import XGBClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, precision_score
 
-# Surprise(%) is deliberately excluded: this feature set is used to test
-# whether survivorship bias affects the price/momentum signal itself,
-# without that comparison being confounded by earnings-data coverage
-# differences between current and delisted tickers. EPS Estimate/Reported
-# EPS are kept - only Surprise(%) is dropped.
-DEFAULT_FEATURES = ['EPS Estimate', 'Reported EPS',
+DEFAULT_FEATURES = ['EPS Estimate', 'Reported EPS', 'Surprise(%)',
                      'Return_60d', 'Sector_Rank_60d']
 TARGET_COLUMN = 'Target_Spike_Class'
 
@@ -45,17 +43,51 @@ def build_model(config=None):
     return XGBClassifier(random_state=42, n_jobs=-1, **config)
 
 
-def train_model(model, X_train, y_train, X_test, y_test):
+def build_logistic_model(config=None):
+    """
+    Pure: config dict -> a StandardScaler + LogisticRegression pipeline -
+    a deliberately low-capacity baseline to compare against build_model's
+    XGBoost. Features are scaled first because logistic regression's
+    coefficients and convergence are sensitive to differing feature
+    scales - unlike XGBoost's tree splits, which are scale-invariant.
+    """
+    config = config or {}
+    return Pipeline([
+        ('scaler', StandardScaler()),
+        ('logreg', LogisticRegression(max_iter=1000, random_state=42, **config)),
+    ])
+
+
+def carve_validation_slice(X_train, y_train, dates, validation_date):
+    """
+    Pure: split a chronologically-ordered training set into (fit set,
+    validation set) using validation_date as the boundary - rows before
+    it are used to fit, rows from validation_date onward form the
+    held-out validation slice used for early stopping.
+    """
+    validation_date = pd.to_datetime(validation_date)
+    fit_mask = dates.loc[X_train.index] < validation_date
+    return (X_train[fit_mask], y_train[fit_mask],
+            X_train[~fit_mask], y_train[~fit_mask])
+
+
+def train_model(model, X_train, y_train, X_test, y_test, eval_set=None):
     """
     I/O (training): fit the model, return it plus predictions on the
-    held-out test set.
+    held-out test set. If eval_set is given, training stops once
+    validation performance plateaus instead of always running the full
+    n_estimators rounds.
     """
-    model.fit(X_train, y_train)
+    if eval_set is not None:
+        model.fit(X_train, y_train, eval_set=eval_set, verbose=False)
+    else:
+        model.fit(X_train, y_train)
 
     y_pred = model.predict(X_test)
     y_pred_proba = model.predict_proba(X_test)[:, 1]
 
     return model, y_pred, y_pred_proba
+
 
 
 def evaluate_predictions(y_test, y_pred, y_pred_proba=None):
@@ -94,12 +126,13 @@ def train_xgboost_event_model(
         "data", "3_features", "event_driven_features.csv"),
     features_df=None,
     split_date="2023-01-01",
+    validation_date=None,
     config=None,
     feature_cols=DEFAULT_FEATURES,
     target_col=TARGET_COLUMN,
 ):
     """
-    Orchestrator: load features -> split_train_test -> build_model ->
+    load features -> split_train_test -> build_model ->
     train_model -> evaluate_predictions. Returns (model, metrics, extras)
     - extras carries the test set + predictions, and metrics/config are
     what the caller passes to experiment_log.log_training_run().
@@ -112,11 +145,25 @@ def train_xgboost_event_model(
     X_train, y_train, X_test, y_test = split_train_test(
         df, split_date, feature_cols, target_col)
 
+    eval_set = None
+    if validation_date is not None:
+        dates = pd.to_datetime(df['Date'])
+        X_train, y_train, X_val, y_val = carve_validation_slice(
+            X_train, y_train, dates, validation_date)
+        eval_set = [(X_val, y_val)]
+
     model = build_model(config)
     model, y_pred, y_pred_proba = train_model(
-        model, X_train, y_train, X_test, y_test)
+        model, X_train, y_train, X_test, y_test, eval_set=eval_set)
 
     metrics = evaluate_predictions(y_test, y_pred, y_pred_proba)
+
+    train_pred = model.predict(X_train)
+    train_pred_proba = model.predict_proba(X_train)[:, 1]
+    train_metrics = evaluate_predictions(y_train, train_pred, train_pred_proba)
+    metrics['train_accuracy'] = train_metrics['accuracy']
+    metrics['train_precision'] = train_metrics['precision']
+
 
     return model, metrics, (X_test, y_test, y_pred, y_pred_proba)
 

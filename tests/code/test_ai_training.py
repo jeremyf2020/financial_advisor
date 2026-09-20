@@ -66,6 +66,45 @@ def test_build_model_applies_config_overrides():
     assert params['max_depth'] == 3
     assert params['n_estimators'] == 50
 
+def test_build_logistic_model_default_config():
+    """ An empty/None config should still produce a valid, seeded pipeline """
+    # Act
+    model = ai.build_logistic_model()
+
+    # Assert
+    assert model.named_steps['logreg'].get_params()['random_state'] == 42
+
+
+def test_build_logistic_model_applies_config_overrides():
+    """ Config dict entries should pass straight through to LogisticRegression """
+    # Act
+    model = ai.build_logistic_model({'C': 0.5, 'penalty': 'l1', 'solver': 'liblinear'})
+
+    # Assert
+    params = model.named_steps['logreg'].get_params()
+    assert params['C'] == 0.5
+    assert params['penalty'] == 'l1'
+
+
+def test_build_logistic_model_fits_and_predicts():
+    """ The pipeline should fit and produce valid predictions/probabilities,
+    exercising the same interface train_model() relies on """
+    # Arrange
+    df = make_fixture_df()
+    X_train, y_train, X_test, y_test = ai.split_train_test(
+        df, split_date="2023-01-01")
+    model = ai.build_logistic_model()
+
+    # Act
+    model, y_pred, y_pred_proba = ai.train_model(
+        model, X_train, y_train, X_test, y_test)
+
+    # Assert
+    assert len(y_pred) == len(y_test)
+    assert all(p in (0, 1) for p in y_pred)
+    assert all(0.0 <= p <= 1.0 for p in y_pred_proba)
+
+
 
 def test_train_model_and_evaluate_predictions():
     """ train_model should return predictions the same length as the test set,
@@ -122,6 +161,64 @@ def test_train_xgboost_event_model_accepts_preloaded_df():
 
     # Assert
     assert 'accuracy' in metrics
+
+def test_carve_validation_slice():
+    """ Rows before validation_date go to the fit set, on/after go to the validation set """
+    # Arrange
+    df = make_fixture_df()
+    X_train, y_train, X_test, y_test = ai.split_train_test(
+        df, split_date="2023-01-01")
+    dates = pd.to_datetime(df['Date'])
+
+    # Act
+    X_fit, y_fit, X_val, y_val = ai.carve_validation_slice(
+        X_train, y_train, dates, validation_date="2022-03-01")
+
+    # Assert
+    assert len(X_fit) == 2   # 2022-01-01, 2022-02-01
+    assert len(X_val) == 2   # 2022-03-01, 2022-04-01
+    assert len(X_fit) + len(X_val) == len(X_train)
+
+
+def test_train_model_with_eval_set_enables_early_stopping():
+    """ Passing eval_set with early_stopping_rounds in the config should
+    still produce valid, test-set-length predictions """
+    # Arrange
+    df = make_fixture_df()
+    X_train, y_train, X_test, y_test = ai.split_train_test(
+        df, split_date="2023-01-01")
+    X_fit, y_fit, X_val, y_val = ai.carve_validation_slice(
+        X_train, y_train, pd.to_datetime(df['Date']), validation_date="2022-03-01")
+    model = ai.build_model(
+        {'n_estimators': 50, 'max_depth': 2, 'early_stopping_rounds': 5})
+
+    # Act
+    model, y_pred, y_pred_proba = ai.train_model(
+        model, X_fit, y_fit, X_test, y_test, eval_set=[(X_val, y_val)])
+
+    # Assert
+    assert len(y_pred) == len(y_test)
+    assert len(y_pred_proba) == len(y_test)
+
+
+def test_train_xgboost_event_model_with_validation_date(tmp_path):
+    """ Orchestrator smoke test: validation_date should narrow the fitted
+    training set and still return a valid metrics dict """
+    # Arrange
+    df = make_fixture_df()
+    features_file = tmp_path / "features.csv"
+    df.to_csv(features_file, index=False)
+
+    # Act
+    model, metrics, extras = ai.train_xgboost_event_model(
+        features_file=str(features_file), split_date="2023-01-01",
+        validation_date="2022-03-01",
+        config={'n_estimators': 20, 'max_depth': 2, 'early_stopping_rounds': 5})
+
+    # Assert
+    assert 'accuracy' in metrics
+    assert 0.0 <= metrics['train_precision'] <= 1.0
+    
 
 
 def test_split_by_universe():
