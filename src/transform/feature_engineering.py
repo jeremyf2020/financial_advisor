@@ -207,6 +207,31 @@ def merge_events(price_features_df, earnings_df):
     return merged.dropna(subset=['Surprise(%)'])
 
 
+def compute_sue(event_df, window=8, min_periods=4):
+    """
+    Pure: Standardized Unexpected Earnings - each event's raw Surprise(%)
+    divided by that company's own trailing standard deviation of its prior
+    surprises (excluding the current one), over up to `window` prior
+    earnings events. This is the normalisation PEAD's original literature
+    actually uses (Bernard & Thomas, 1989, 1990), not the raw Surprise(%)
+    this pipeline otherwise uses as a feature - the same magnitude of
+    surprise means something very different for a company with a history
+    of volatile earnings vs. a stable one, and raw Surprise(%) can't tell
+    them apart. Rows with fewer than min_periods prior events for that
+    Symbol, or a prior surprise history with zero variance, are NaN -
+    there isn't enough (or varied enough) history yet to standardise
+    against, not a legitimate SUE of 0 or infinity.
+    """
+    result = event_df.sort_values(by=['Symbol', 'Date']).reset_index(drop=True).copy()
+
+    prior_std = result.groupby('Symbol')['Surprise(%)'].transform(
+        lambda s: s.shift(1).rolling(window=window, min_periods=min_periods).std())
+
+    result['SUE'] = result['Surprise(%)'] / prior_std.replace(0, float('nan'))
+
+    return result
+
+
 def generate_earnings_driven_features(
     prices_dir=os.path.join("data", "1_raw", "prices"),
     metadata_file=os.path.join("data", "2_processed", "stock_metadata.csv"),
@@ -223,16 +248,23 @@ def generate_earnings_driven_features(
     take_profit=0.05,
     stop_loss=0.03,
     max_holding_days=5,
+    use_sue=False,
+    sue_window=8,
+    sue_min_periods=4,
 ):
     """
     Orchestrator: wire load_price_panel -> merge_sector_map ->
     compute_momentum_features -> compute_sector_rank ->
     compute_forward_returns -> (label_spike_event or
-    compute_triple_barrier_labels) -> merge_events, then write the final
-    event-driven feature table to output_file. use_triple_barrier swaps
-    the labeling step; take_profit/stop_loss/max_holding_days only apply
-    when it's set. label_price_col only applies to label_spike_event -
-    see its docstring for the target/execution alignment rationale.
+    compute_triple_barrier_labels) -> merge_events -> (compute_sue, if
+    use_sue) -> write the final event-driven feature table to
+    output_file. use_triple_barrier swaps the labeling step; take_profit/
+    stop_loss/max_holding_days only apply when it's set. label_price_col
+    only applies to label_spike_event - see its docstring for the
+    target/execution alignment rationale. use_sue adds a 'SUE' column
+    (see compute_sue) alongside the existing raw 'Surprise(%)' column,
+    rather than replacing it - callers choose which one to actually train
+    on via their own feature list.
     """
     metadata_df = pd.read_csv(metadata_file)
     earnings_df = pd.read_csv(earnings_file)
@@ -251,12 +283,14 @@ def generate_earnings_driven_features(
             price_df, spike_threshold, forward_horizon, label_price_col)
 
     event_df = merge_events(price_df, earnings_df)
+    if use_sue:
+        event_df = compute_sue(event_df, window=sue_window, min_periods=sue_min_periods)
     event_df = event_df.dropna(subset=[
         f'Return_{sector_rank_window}d', f'Target_T{forward_horizon}_High_Ret'])
 
     final_cols = [
         'Date', 'Symbol', 'Sector', 'Close', 'Volume',
-        'EPS Estimate', 'Reported EPS', 'Surprise(%)',
+        'EPS Estimate', 'Reported EPS', 'Surprise(%)', 'SUE',
         'Return_14d', f'Return_{sector_rank_window}d', f'Sector_Rank_{sector_rank_window}d',
         f'Target_T{forward_horizon}_Open_Ret', f'Target_T{forward_horizon}_High_Ret',
         f'Target_T{forward_horizon}_Low_Ret', f'Target_T{forward_horizon}_Close_Ret',
@@ -269,7 +303,6 @@ def generate_earnings_driven_features(
     final_df.to_csv(output_file, index=False)
 
     return final_df
-
 
 
 if __name__ == "__main__":

@@ -300,6 +300,75 @@ def test_merge_events_keeps_only_announcement_days():
     assert result.iloc[0]['Date'] == pd.Timestamp('2024-01-02').date()
 
 
+def test_compute_sue_standardizes_by_trailing_std():
+    """ SUE should divide the current surprise by the std of the PRIOR
+    `window` surprises for that Symbol (excluding the current one) """
+    # Arrange: 5 earnings events for AAPL, increasing surprise each time
+    event_df = pd.DataFrame({
+        'Symbol': ['AAPL'] * 5,
+        'Date': pd.date_range('2023-01-01', periods=5, freq='90D'),
+        'Surprise(%)': [2.0, 4.0, 6.0, 8.0, 10.0],
+    })
+
+    # Act
+    result = fe.compute_sue(event_df, window=4, min_periods=4)
+
+    # Assert: 5th event's SUE = 10 / std([2, 4, 6, 8])
+    expected_std = pd.Series([2.0, 4.0, 6.0, 8.0]).std()
+    assert result.iloc[4]['SUE'] == pytest.approx(10.0 / expected_std)
+
+
+def test_compute_sue_insufficient_history_is_nan():
+    """ Events with fewer than min_periods prior surprises should get NaN,
+    not an unstable estimate from too little data """
+    # Arrange
+    event_df = pd.DataFrame({
+        'Symbol': ['AAPL'] * 5,
+        'Date': pd.date_range('2023-01-01', periods=5, freq='90D'),
+        'Surprise(%)': [2.0, 4.0, 6.0, 8.0, 10.0],
+    })
+
+    # Act
+    result = fe.compute_sue(event_df, window=4, min_periods=4)
+
+    # Assert: 4th event only has 3 prior surprises - below min_periods
+    assert pd.isna(result.iloc[3]['SUE'])
+
+
+def test_compute_sue_does_not_leak_across_symbols():
+    """ Each Symbol's SUE should be standardized against its own history only """
+    # Arrange: MSFT has no prior earnings events at all
+    event_df = pd.DataFrame({
+        'Symbol': ['AAPL', 'AAPL', 'AAPL', 'AAPL', 'MSFT'],
+        'Date': list(pd.date_range('2023-01-01', periods=4, freq='90D')) + [pd.Timestamp('2023-01-01')],
+        'Surprise(%)': [2.0, 4.0, 6.0, 8.0, 100.0],
+    })
+
+    # Act
+    result = fe.compute_sue(event_df, window=4, min_periods=1)
+
+    # Assert: MSFT's SUE is NaN regardless of AAPL's history
+    msft_row = result[result['Symbol'] == 'MSFT'].iloc[0]
+    assert pd.isna(msft_row['SUE'])
+
+
+def test_compute_sue_zero_std_is_nan_not_inf():
+    """ A company with identical prior surprises (zero variance) should
+    give NaN, not a division-by-zero infinity """
+    # Arrange
+    event_df = pd.DataFrame({
+        'Symbol': ['AAPL'] * 4,
+        'Date': pd.date_range('2023-01-01', periods=4, freq='90D'),
+        'Surprise(%)': [5.0, 5.0, 5.0, 5.0],
+    })
+
+    # Act
+    result = fe.compute_sue(event_df, window=3, min_periods=3)
+
+    # Assert
+    assert pd.isna(result.iloc[3]['SUE'])
+
+
 def test_generate_earnings_driven_features_smoke(tmp_path):
     """
     Orchestrator smoke test: wires every step together end-to-end against
