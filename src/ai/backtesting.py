@@ -1,4 +1,5 @@
 import os
+import numpy as np
 import pandas as pd
 from src.utils import experiment_log
 
@@ -191,6 +192,58 @@ def compute_backtest_kpis(equity_curve_df, trades_df, return_col=DEFAULT_RETURN_
         'max_drawdown': drawdown.min(),
         'sharpe': sharpe,
     }
+
+
+def bootstrap_backtest_metrics(trades_df, n_bootstrap=2000, seed=42, transaction_cost=0.001,
+                                return_col=DEFAULT_RETURN_COL, max_position_weight=None,
+                                initial_capital=100000):
+    """
+    Pure: bootstrap resampling (with replacement, i.i.d. at the trade level)
+    of trades_df, re-run through compute_daily_portfolio_returns ->
+    build_equity_curve -> compute_backtest_kpis for each of n_bootstrap
+    resamples, to get an empirical distribution of
+    total_return/win_rate/max_drawdown/sharpe under trade-level resampling
+    uncertainty. Each resample keeps the same trade count as trades_df but
+    reassigns which specific trades occurred (sampling with replacement),
+    then re-groups by Date exactly as the real backtest does - a Date drawn
+    twice contributes twice to that day's aggregate, same as if two
+    independent signals had actually fired that day. This is an i.i.d.
+    assumption at the trade level - it does not model day-to-day return
+    autocorrelation, and it only captures "how much would the result move
+    under a different random draw of these same trades", not the broader
+    question of whether the whole strategy-selection process was itself
+    overfit (see Bailey, Borwein, Lopez de Prado & Zhu 2014, "The
+    Probability of Backtest Overfitting", for that separate question).
+    Returns a DataFrame with one row per resample and columns
+    ['total_return', 'win_rate', 'max_drawdown', 'sharpe'].
+    """
+    rng = np.random.default_rng(seed)
+    n = len(trades_df)
+    rows = []
+    for _ in range(n_bootstrap):
+        sample_idx = rng.integers(0, n, size=n)
+        resampled = trades_df.iloc[sample_idx].reset_index(drop=True)
+        daily_returns_df = compute_daily_portfolio_returns(
+            resampled, transaction_cost, return_col, max_position_weight)
+        equity_curve_df = build_equity_curve(daily_returns_df, initial_capital)
+        rows.append(compute_backtest_kpis(equity_curve_df, resampled, return_col))
+
+    return pd.DataFrame(rows)
+
+
+def compute_confidence_interval(values, ci=0.95):
+    """
+    Pure: percentile confidence interval - the (lower, upper) bounds
+    spanning the central `ci` fraction of the empirical distribution
+    `values` (e.g. ci=0.95 keeps the 2.5th-97.5th percentiles, dropping the
+    2.5% most extreme values on each tail). Works on any array-like of
+    values, most commonly one column of bootstrap_backtest_metrics'
+    output.
+    """
+    alpha = (1 - ci) / 2
+    lower = float(np.percentile(values, alpha * 100))
+    upper = float(np.percentile(values, (1 - alpha) * 100))
+    return lower, upper
 
 
 def run_event_driven_backtest(

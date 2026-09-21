@@ -273,6 +273,72 @@ def test_compute_backtest_kpis_empty_input():
                         'max_drawdown': 0.0, 'sharpe': 0.0}
 
 
+def test_bootstrap_backtest_metrics_returns_one_row_per_resample():
+    """ Should produce exactly n_bootstrap rows, one per resample, with the four KPI columns """
+    trades_df = pd.DataFrame({
+        'Date': ['2022-01-01', '2022-01-02', '2022-01-03'],
+        'Target_T1_Close_Ret': [0.05, -0.02, 0.03],
+    })
+
+    result = bt.bootstrap_backtest_metrics(trades_df, n_bootstrap=50, seed=1)
+
+    assert len(result) == 50
+    assert set(result.columns) == {'total_return', 'win_rate', 'max_drawdown', 'sharpe'}
+
+
+def test_bootstrap_backtest_metrics_reproducible_with_seed():
+    """ Same seed should give identical resamples, and therefore identical metrics """
+    trades_df = pd.DataFrame({
+        'Date': ['2022-01-01', '2022-01-02', '2022-01-03', '2022-01-04'],
+        'Target_T1_Close_Ret': [0.05, -0.02, 0.03, -0.01],
+    })
+
+    result_a = bt.bootstrap_backtest_metrics(trades_df, n_bootstrap=20, seed=7)
+    result_b = bt.bootstrap_backtest_metrics(trades_df, n_bootstrap=20, seed=7)
+
+    pd.testing.assert_frame_equal(result_a, result_b)
+
+
+def test_bootstrap_backtest_metrics_zero_variance_for_uniform_trades():
+    """
+    If every trade has an identical return, every resample (any draw of
+    those same trades) must produce the identical metrics - a sanity check
+    that resampling is drawing over the trade axis, not silently doing
+    nothing
+    """
+    trades_df = pd.DataFrame({
+        'Date': ['2022-01-01', '2022-01-02', '2022-01-03'],
+        'Target_T1_Close_Ret': [0.05, 0.05, 0.05],
+    })
+
+    result = bt.bootstrap_backtest_metrics(
+        trades_df, n_bootstrap=30, seed=3, transaction_cost=0.0)
+
+    assert result['win_rate'].nunique() == 1
+    assert result['win_rate'].iloc[0] == pytest.approx(1.0)
+
+
+def test_compute_confidence_interval_basic():
+    """ 95% CI should keep the middle 95% of the distribution, matching the
+    standard percentile-interpolation definition """
+    values = list(range(100))  # 0..99
+
+    lower, upper = bt.compute_confidence_interval(values, ci=0.95)
+
+    assert lower == pytest.approx(2.475)
+    assert upper == pytest.approx(96.525)
+
+
+def test_compute_confidence_interval_narrower_for_smaller_ci():
+    """ A smaller ci should give a tighter (narrower) interval than a larger one """
+    values = list(range(100))
+
+    lower_95, upper_95 = bt.compute_confidence_interval(values, ci=0.95)
+    lower_50, upper_50 = bt.compute_confidence_interval(values, ci=0.50)
+
+    assert (upper_50 - lower_50) < (upper_95 - lower_95)
+
+
 def test_run_event_driven_backtest_smoke(tmp_path):
     """
     Orchestrator smoke test: wires filter -> daily returns -> equity curve
