@@ -114,7 +114,13 @@ def compute_tranche_portfolio_returns(trades_df, horizon, n_tranches=None,
 
     accepted_df = sorted_df[accepted_mask].reset_index(drop=True)
 
-    if accepted_df.empty:
+    if accepted_df.empty:  # pragma: no cover - defensive only: the loop
+        # above always accepts the first (chronologically earliest) trade,
+        # since free_at starts at Timestamp.min for every tranche, so this
+        # is unreachable via any valid n_tranches/horizon combination given
+        # a non-empty sorted_df (already handled above). Kept as a guard
+        # against the 1/n_tranches division below, in case that invariant
+        # ever changes.
         return pd.DataFrame(columns=['Date', 'Daily_Return']), accepted_df
 
     weight = 1 / n_tranches

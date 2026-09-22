@@ -1,0 +1,12 @@
+[run]
+source = src
+
+[report]
+# `if __name__ == "__main__":` blocks are script entry points (run manually
+# via `python -m src.ai.backtesting` etc. for ad-hoc use), not part of any
+# import path the app or tests exercise - excluding them keeps the coverage
+# number meaningful (measuring real logic, not CLI boilerplate) instead of
+# just chasing 100%.
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:

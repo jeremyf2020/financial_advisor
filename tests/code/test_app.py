@@ -3,6 +3,7 @@ import pandas as pd
 from unittest.mock import patch
 from fastapi.testclient import TestClient
 from xgboost import XGBClassifier
+from src.ai import model_persistence
 from src.web.app import app, get_features_df, get_model_bundle
 
 FEATURE_COLS = ['EPS Estimate', 'Reported EPS', 'Surprise(%)', 'Return_60d', 'Sector_Rank_60d']
@@ -87,3 +88,37 @@ def test_recommend_unknown_ticker_returns_404(client):
 
     assert response.status_code == 404
     assert 'NOPE' in response.json()['detail']
+
+
+def test_lifespan_loads_real_features_and_model_from_disk(tmp_path, monkeypatch):
+    """ Every other test bypasses the real lifespan() startup via
+    dependency_overrides (get_features_df/get_model_bundle are swapped out
+    entirely). This exercises the actual startup path - reading
+    FEATURES_FILE/MODEL_FILE from disk into app.state - the same way the
+    real app does when uvicorn boots it, using real (tiny) files on disk
+    rather than mocks. FEATURES_FILE/MODEL_FILE are module-level globals
+    read once at import time, so they're monkeypatched directly rather
+    than via environment variables, which lifespan() would no longer see
+    post-import. """
+    features_path = tmp_path / "features.csv"
+    make_features_df().to_csv(features_path, index=False)
+
+    model_path = tmp_path / "model.joblib"
+    bundle = model_persistence.build_model_bundle(
+        model=make_model_bundle()['model'], feature_cols=FEATURE_COLS,
+        target_col='Target_Spike_Class', config={'spike_threshold': 0.07},
+        run_id='real_lifespan_test')
+    model_persistence.save_model(
+        bundle, model_file=str(model_path),
+        metadata_file=str(tmp_path / "model_metadata.json"))
+
+    monkeypatch.setattr('src.web.app.FEATURES_FILE', str(features_path))
+    monkeypatch.setattr('src.web.app.MODEL_FILE', str(model_path))
+
+    with TestClient(app) as real_client:
+        response = real_client.get("/api/health")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['model_run_id'] == 'real_lifespan_test'
+    assert body['features_rows'] == 3
