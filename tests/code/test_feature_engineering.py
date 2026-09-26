@@ -415,3 +415,75 @@ def test_generate_earnings_driven_features_smoke(tmp_path):
     assert row['Sector'] == 'Information Technology'
     assert not pd.isna(row['Return_60d'])
     assert not pd.isna(row['Target_Spike_Class'])
+
+
+def test_compute_latest_price_snapshot_picks_max_date_per_symbol():
+    """ Should return only the most recent row per Symbol, regardless of row order """
+    # Arrange
+    price_df = pd.DataFrame({
+        'Date': ['2024-01-01', '2024-03-01', '2024-02-01'],
+        'Symbol': ['AAPL', 'AAPL', 'MSFT'],
+        'Return_60d': [0.01, 0.05, 0.02],
+    })
+
+    # Act
+    result = fe.compute_latest_price_snapshot(price_df, sector_rank_window=60)
+
+    # Assert
+    assert len(result) == 2
+    aapl = result[result['Symbol'] == 'AAPL'].iloc[0]
+    assert aapl['Date'] == '2024-03-01'
+    assert aapl['Return_60d'] == 0.05
+
+
+def test_compute_latest_price_snapshot_drops_rows_without_enough_history():
+    """ A row with no Return_60d yet (insufficient price history) should not surface as a snapshot """
+    # Arrange
+    price_df = pd.DataFrame({
+        'Date': ['2024-01-01', '2024-01-02'],
+        'Symbol': ['NEWCO', 'NEWCO'],
+        'Return_60d': [float('nan'), float('nan')],
+    })
+
+    # Act
+    result = fe.compute_latest_price_snapshot(price_df, sector_rank_window=60)
+
+    # Assert
+    assert result.empty
+
+
+def test_generate_latest_price_snapshot_smoke(tmp_path):
+    """
+    Orchestrator smoke test: wires load_price_panel -> merge_sector_map ->
+    compute_momentum_features -> compute_sector_rank -> snapshot together,
+    with no earnings data involved at all
+    """
+    # Arrange: 70 days of price history, long enough to clear the 60d window
+    prices_dir = tmp_path / "prices"
+    prices_dir.mkdir()
+
+    dates = pd.date_range("2024-01-01", periods=70, freq="D")
+    closes = [100.0 + i * 0.5 for i in range(70)]
+    price_df = pd.DataFrame({
+        'date': dates.strftime('%Y-%m-%d'),
+        'open': closes, 'high': [c + 1 for c in closes],
+        'low': [c - 1 for c in closes], 'close': closes,
+        'adjusted_close': closes, 'volume': [1000000] * 70,
+    })
+    price_df.to_csv(prices_dir / "AAPL.csv", index=False)
+
+    metadata_file = tmp_path / "stock_metadata.csv"
+    pd.DataFrame({'Symbol': ['AAPL'], 'Sector': ['Information Technology']}).to_csv(
+        metadata_file, index=False)
+
+    # Act
+    result_df = fe.generate_latest_price_snapshot(
+        prices_dir=str(prices_dir), metadata_file=str(metadata_file))
+
+    # Assert: exactly the last trading day, with Return_60d/Sector_Rank_60d populated
+    assert len(result_df) == 1
+    row = result_df.iloc[0]
+    assert row['Symbol'] == 'AAPL'
+    assert str(row['Date']) == dates[-1].strftime('%Y-%m-%d')
+    assert not pd.isna(row['Return_60d'])
+    assert not pd.isna(row['Sector_Rank_60d'])

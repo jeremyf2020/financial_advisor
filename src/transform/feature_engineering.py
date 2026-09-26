@@ -108,6 +108,24 @@ def compute_sector_rank(price_df, window=60):
     return result
 
 
+def compute_latest_price_snapshot(price_df, sector_rank_window=60):
+    """
+    Pure: the most recent available row per Symbol from a price panel that
+    already carries Return_Nd/Sector_Rank_Nd (i.e. after
+    compute_momentum_features + compute_sector_rank). Unlike
+    event_driven_features.csv, which only keeps days with an actual
+    earnings announcement (see merge_events), this keeps every ticker's
+    latest row regardless of whether an event happened that day - powering
+    scenario analysis for a ticker's next, not-yet-reported earnings event,
+    where momentum/sector-rank are already knowable today even though
+    Surprise(%)/Reported EPS are not. Rows without enough price history yet
+    for Return_{window}d are dropped, not returned with a NaN snapshot.
+    """
+    return_col = f'Return_{sector_rank_window}d'
+    result = price_df.dropna(subset=[return_col])
+    return result.sort_values('Date').groupby('Symbol').last().reset_index()
+
+
 def compute_forward_returns(price_df, horizon=1):
     """
     Pure: T+horizon OHLC returns relative to the current Close - the
@@ -303,6 +321,28 @@ def generate_earnings_driven_features(
     final_df.to_csv(output_file, index=False)
 
     return final_df
+
+
+def generate_latest_price_snapshot(
+    prices_dir=os.path.join("data", "1_raw", "prices"),
+    metadata_file=os.path.join("data", "2_processed", "stock_metadata.csv"),
+    momentum_windows=(14, 60),
+    sector_rank_window=60,
+):
+    """
+    Orchestrator: wire load_price_panel -> merge_sector_map ->
+    compute_momentum_features -> compute_sector_rank ->
+    compute_latest_price_snapshot. Does not touch earnings data at all -
+    this is deliberately the subset of generate_earnings_driven_features's
+    pipeline that needs no reported earnings result, so it stays valid for
+    a ticker whose next earnings event hasn't happened yet.
+    """
+    metadata_df = pd.read_csv(metadata_file)
+    price_df = load_price_panel(prices_dir)
+    price_df = merge_sector_map(price_df, metadata_df)
+    price_df = compute_momentum_features(price_df, momentum_windows)
+    price_df = compute_sector_rank(price_df, sector_rank_window)
+    return compute_latest_price_snapshot(price_df, sector_rank_window)
 
 
 if __name__ == "__main__":

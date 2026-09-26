@@ -1,12 +1,30 @@
 import { useState, useEffect } from "react";
 import TickerSearch from "./components/TickerSearch";
 import RecommendationCard from "./components/RecommendationCard";
-import { getTickers, getRecommendation } from "./api";
-import type { Ticker, Recommendation } from "./types";
+import UpcomingEarnings from "./components/UpcomingEarnings";
+import ScenarioCard from "./components/ScenarioCard";
+import {
+  getTickers,
+  getRecommendation,
+  getUpcomingEarnings,
+  getScenarioAnalysis,
+} from "./api";
+import type {
+  Ticker,
+  Recommendation,
+  UpcomingEarning,
+  ScenarioAnalysis,
+} from "./types";
 
 export default function App() {
   const [tickers, setTickers] = useState<Ticker[]>([]);
+  const [upcomingEarnings, setUpcomingEarnings] = useState<UpcomingEarning[]>(
+    [],
+  );
   const [result, setResult] = useState<Recommendation | null>(null);
+  const [scenarioResult, setScenarioResult] = useState<ScenarioAnalysis | null>(
+    null,
+  );
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -14,15 +32,34 @@ export default function App() {
     getTickers()
       .then(setTickers)
       .catch(() => setTickers([]));
+    getUpcomingEarnings()
+      .then(setUpcomingEarnings)
+      .catch(() => setUpcomingEarnings([]));
   }, []);
 
   async function handleSubmit(ticker: string) {
     setLoading(true);
     setError(null);
     setResult(null);
+    setScenarioResult(null);
     try {
       const data = await getRecommendation(ticker);
       setResult(data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Something went wrong");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleSelectUpcoming(ticker: string) {
+    setLoading(true);
+    setError(null);
+    setResult(null);
+    setScenarioResult(null);
+    try {
+      const data = await getScenarioAnalysis(ticker);
+      setScenarioResult(data);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong");
     } finally {
@@ -53,6 +90,12 @@ export default function App() {
           loading={loading}
         />
 
+        <UpcomingEarnings
+          earnings={upcomingEarnings}
+          onSelect={handleSelectUpcoming}
+          loading={loading}
+        />
+
         {loading && (
           <div className="flex items-center justify-center h-32 text-slate-400">
             <div className="text-center">
@@ -69,6 +112,7 @@ export default function App() {
         )}
 
         {result && <RecommendationCard result={result} />}
+        {scenarioResult && <ScenarioCard result={scenarioResult} />}
 
         <footer className="text-xs text-slate-500 pt-4">
           Prototype — predictions are based on a model still under active tuning
