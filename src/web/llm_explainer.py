@@ -18,6 +18,8 @@ def format_prompt(rec):
     return (
         "You are a financial advisor bot explaining a stock prediction to a "
         "non-technical user in 2-3 plain-English sentences.\n\n"
+        "Start directly with the explanation itself - do not begin with a "
+        "meta-comment like 'Here's a plain-English explanation' or similar.\n\n"
         "Use ONLY the numbers given below - do not invent, estimate, or round "
         "any number that isn't explicitly provided.\n\n"
         f"Ticker: {rec['ticker']}\n"
