@@ -67,6 +67,14 @@ export default function App() {
     }
   }
 
+  function handleClear() {
+    setResult(null);
+    setScenarioResult(null);
+    setError(null);
+  }
+
+  const showingResult = Boolean(result || scenarioResult || error);
+
   return (
     <div className="min-h-screen bg-slate-900 text-slate-100">
       <header className="border-b border-slate-700 bg-slate-900/80 backdrop-blur sticky top-0 z-10">
@@ -90,11 +98,22 @@ export default function App() {
           loading={loading}
         />
 
-        <UpcomingEarnings
-          earnings={upcomingEarnings}
-          onSelect={handleSelectUpcoming}
-          loading={loading}
-        />
+        {!showingResult && !loading && (
+          <UpcomingEarnings
+            earnings={upcomingEarnings}
+            onSelect={handleSelectUpcoming}
+            loading={loading}
+          />
+        )}
+
+        {showingResult && !loading && (
+          <button
+            onClick={handleClear}
+            className="text-sm text-slate-400 hover:text-slate-200 transition-colors"
+          >
+            ← Back to upcoming earnings
+          </button>
+        )}
 
         {loading && (
           <div className="flex items-center justify-center h-32 text-slate-400">
